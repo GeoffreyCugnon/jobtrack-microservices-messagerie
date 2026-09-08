@@ -1,0 +1,10 @@
+node_modules/
+dist/
+coverage/
+src/generated/
+*.log
+.env
+.DS_Store
+
+# Local download copy of files sent via SendUserFile (see JobTrack/CLAUDE.md).
+Claude outputs/

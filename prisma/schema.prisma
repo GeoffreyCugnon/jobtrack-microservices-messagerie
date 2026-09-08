@@ -1,0 +1,69 @@
+// ---------------------------------------------------------------------------
+// Schéma Prisma du micro-service de messagerie one-to-one.
+//
+// Instance isolée par projet hôte : aucune colonne "projet"/"tenant" ici,
+// l'isolation est assurée par le déploiement (une base dédiée par instance).
+// ---------------------------------------------------------------------------
+
+generator client {
+  provider     = "prisma-client"
+  output       = "../src/generated/prisma"
+  moduleFormat = "cjs"
+  runtime      = "nodejs"
+}
+
+datasource db {
+  provider = "postgresql"
+  // La chaîne de connexion n'est plus déclarée ici (Prisma 7) : elle est lue
+  // depuis MESSAGING_DATABASE_URL dans prisma.config.ts (Migrate/CLI) et injectée
+  // au runtime via l'adaptateur pg dans PrismaService.
+}
+
+/// Fil de discussion entre exactement deux utilisateurs.
+model Conversation {
+  id String @id @default(uuid())
+
+  // Les deux participants. À l'insertion, ConversationsService normalise l'ordre
+  // (userAId < userBId) pour qu'une même paire ne produise jamais deux lignes,
+  // garantie par la contrainte @@unique ci-dessous.
+  userAId String
+  userBId String
+
+  /// Horodatage du dernier message ; null tant qu'aucun message n'a été envoyé.
+  /// Sert au tri de la liste des conversations (récentes d'abord).
+  lastMessageAt DateTime? @db.Timestamptz
+  createdAt     DateTime  @default(now()) @db.Timestamptz
+
+  /// Zone libre pour le projet hôte (titre, contexte…) ; non interprétée ici.
+  metadata Json?
+
+  messages Message[]
+
+  // Unicité de la paire d'utilisateurs (ordre normalisé en amont).
+  @@unique([userAId, userBId])
+}
+
+/// Message unitaire appartenant à une conversation.
+model Message {
+  id             String       @id @default(uuid())
+  conversationId String
+  conversation   Conversation @relation(fields: [conversationId], references: [id])
+
+  /// Auteur du message (= claim `sub` du JWT).
+  senderId String
+  content  String
+
+  /// Null tant que le destinataire n'a pas marqué le message comme lu.
+  readAt    DateTime? @db.Timestamptz
+  createdAt DateTime  @default(now()) @db.Timestamptz
+
+  /// Zone libre pour le projet hôte (pièces jointes, type…) ; non interprétée ici.
+  metadata Json?
+
+  // NB : un index partiel sur les messages non lus
+  // (WHERE "readAt" IS NULL) est ajouté par une migration SQL manuelle,
+  // prisma/migrations/20250101000100_unread_messages_partial_index.
+
+  // Sert la pagination par curseur (ORDER BY createdAt) filtrée par conversation.
+  @@index([conversationId, createdAt])
+}
