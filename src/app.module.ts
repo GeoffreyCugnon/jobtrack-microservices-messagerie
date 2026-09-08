@@ -8,6 +8,7 @@ import { AuthModule } from './auth/auth.module';
 import { REST_THROTTLE } from './common/rate-limit.constants';
 import { RestThrottlerGuard } from './common/rest-throttler.guard';
 import { ConversationsModule } from './conversations/conversations.module';
+import { HealthModule } from './health/health.module';
 import { MessagesModule } from './messages/messages.module';
 import { MessagingModule } from './messaging/messaging.module';
 import { NatsModule } from './nats/nats.module';
@@ -34,6 +35,7 @@ import { PrismaModule } from './prisma/prisma.module';
     ConversationsModule,
     MessagesModule,
     MessagingModule,
+    HealthModule,
   ],
   providers: [
     // Rate limiting REST en premier : un flood est rejeté (429) avant même la

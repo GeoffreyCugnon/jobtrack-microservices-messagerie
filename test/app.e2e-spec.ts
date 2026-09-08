@@ -30,6 +30,7 @@ import { PrismaService } from '../src/prisma/prisma.service';
 const prismaMock = {
   $connect: jest.fn().mockResolvedValue(undefined),
   $disconnect: jest.fn().mockResolvedValue(undefined),
+  $queryRaw: jest.fn().mockResolvedValue([{ result: 1 }]),
   conversation: { findMany: jest.fn().mockResolvedValue([]) },
 };
 
@@ -93,6 +94,13 @@ describe('Messaging skeleton (e2e)', () => {
       .set('Authorization', auth())
       .send({ participantId: '11111111-1111-1111-1111-111111111111', wat: true })
       .expect(400);
+  });
+
+  it('serves GET /health publicly (no JWT) with a status report', async () => {
+    const res = await request(http()).get('/health').expect(200);
+
+    expect(res.body).toMatchObject({ status: 'ok', database: 'ok', nats: 'disabled' });
+    expect(prismaMock.$queryRaw).toHaveBeenCalled();
   });
 
   it('returns 429 Too Many Requests once the REST throttle limit is exceeded', async () => {

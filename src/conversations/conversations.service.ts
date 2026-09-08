@@ -1,4 +1,5 @@
 import { ForbiddenException, Injectable, NotFoundException } from '@nestjs/common';
+import { assertUuid } from '../common/assert';
 import { Conversation, Prisma } from '../generated/prisma/client';
 
 /** Conversation enrichie du nombre de messages non lus pour l'appelant. */
@@ -69,6 +70,8 @@ export class ConversationsService {
    * création réelle (pas quand une conversation existante est renvoyée).
    */
   async findOrCreate(userId: string, otherUserId: string): Promise<Conversation> {
+    // Défense en profondeur : `participantId` est déjà `@IsUUID` au niveau DTO.
+    assertUuid(otherUserId, 'participantId');
     if (userId === otherUserId) {
       throw new ForbiddenException('Cannot open a conversation with yourself');
     }

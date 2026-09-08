@@ -1,5 +1,6 @@
 import { ForbiddenException, Injectable, Logger, NotFoundException } from '@nestjs/common';
 import { EventEmitter2 } from '@nestjs/event-emitter';
+import { assertMessageContent, assertUuid } from '../common/assert';
 import { Message, Prisma } from '../generated/prisma/client';
 import {
   CONVERSATION_READ,
@@ -17,6 +18,8 @@ import { SendMessageDto } from './dto/send-message.dto';
 
 /** Taille de page par défaut de la pagination par curseur. */
 const DEFAULT_PAGE_SIZE = 30;
+/** Borne dure de la taille de page, même si un appelant contourne le DTO. */
+const MAX_PAGE_SIZE = 100;
 
 /** Résultat paginé : `nextCursor` est l'id à repasser en `?cursor=` pour la page suivante. */
 export interface MessagePage {
@@ -74,7 +77,8 @@ export class MessagesService {
   ): Promise<MessagePage> {
     await this.conversations.getParticipantConversation(conversationId, userId);
 
-    const take = limit + 1;
+    const safeLimit = Math.min(Math.max(Math.trunc(limit) || DEFAULT_PAGE_SIZE, 1), MAX_PAGE_SIZE);
+    const take = safeLimit + 1;
     const rows = await this.prisma.message.findMany({
       where: { conversationId },
       // `id` en second critère : ordre stable si deux messages ont le même createdAt.
@@ -84,12 +88,17 @@ export class MessagesService {
     });
 
     const hasMore = rows.length === take;
-    const items = hasMore ? rows.slice(0, limit) : rows;
+    const items = hasMore ? rows.slice(0, safeLimit) : rows;
     return { items, nextCursor: hasMore ? items[items.length - 1].id : null };
   }
 
   /** Crée un message, met à jour `lastMessageAt`, puis diffuse (WebSocket + NATS). */
   async send(conversationId: string, senderId: string, dto: SendMessageDto): Promise<Message> {
+    // Défense en profondeur : DTO (`@IsUUID`, `@MinLength/@MaxLength`) et
+    // `ParseUUIDPipe` valident déjà en amont sur les chemins REST et WS.
+    assertUuid(conversationId, 'conversationId');
+    assertMessageContent(dto.content);
+
     const conversation = await this.conversations.getParticipantConversation(
       conversationId,
       senderId,

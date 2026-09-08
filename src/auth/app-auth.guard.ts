@@ -1,8 +1,10 @@
 import { CanActivate, ExecutionContext, Injectable } from '@nestjs/common';
+import { Reflector } from '@nestjs/core';
 import { WsException } from '@nestjs/websockets';
 import { AuthedRequest, AuthedSocket } from './auth-user.interface';
 import { AuthService } from './auth.service';
 import { extractHttpToken, extractWsToken } from './extract-token';
+import { IS_PUBLIC_KEY } from './public.decorator';
 
 /**
  * Guard unique, enregistré en APP_GUARD (cf. AppModule), donc appliqué à la fois
@@ -16,9 +18,21 @@ import { extractHttpToken, extractWsToken } from './extract-token';
  */
 @Injectable()
 export class AppAuthGuard implements CanActivate {
-  constructor(private readonly authService: AuthService) {}
+  constructor(
+    private readonly authService: AuthService,
+    private readonly reflector: Reflector,
+  ) {}
 
   canActivate(context: ExecutionContext): boolean {
+    // Routes marquées @Public() (ex. GET /health) : pas de JWT requis.
+    const isPublic = this.reflector.getAllAndOverride<boolean>(IS_PUBLIC_KEY, [
+      context.getHandler(),
+      context.getClass(),
+    ]);
+    if (isPublic) {
+      return true;
+    }
+
     if (context.getType() === 'ws') {
       const client = context.switchToWs().getClient<AuthedSocket>();
       try {
