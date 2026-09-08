@@ -1,32 +1,40 @@
+import { ForbiddenException, NotFoundException } from '@nestjs/common';
 import { EventEmitter2 } from '@nestjs/event-emitter';
 import type { NatsConnection } from 'nats';
+import {
+  TEST_CONVERSATION_ID,
+  TEST_USERS,
+  makeConversation,
+  makeMessage,
+} from '../common/test-fixtures';
 import { ConversationsService } from '../conversations/conversations.service';
 import { NatsPublisherService } from '../nats/nats-publisher.service';
+import { OutboxService } from '../nats/outbox.service';
 import { PrismaService } from '../prisma/prisma.service';
 import { MessagesService } from './messages.service';
 
 /**
- * Vérifie que l'événement d'intégration NATS est bien publié APRÈS l'écriture
- * Prisma, et que l'échec de publication ne casse pas l'envoi (best-effort).
- * Tout est mocké : Prisma, ConversationsService, l'event bus, et le client NATS.
+ * Tests unitaires : Prisma, ConversationsService et l'event bus mockés ; vrai
+ * NatsPublisherService au-dessus d'un vrai OutboxService avec une connexion NATS
+ * mockée (pour vérifier la publication réelle des événements d'intégration).
  */
-describe('MessagesService integration events', () => {
-  const conversationId = '11111111-1111-1111-1111-111111111111';
+describe('MessagesService', () => {
   const createdAt = new Date('2026-09-07T10:00:00.000Z');
-
-  const messageRow = {
-    id: 'msg-1',
-    conversationId,
-    senderId: 'user-a',
-    content: 'hello',
-    readAt: null,
-    createdAt,
-    metadata: null,
-  };
+  const conversationRow = makeConversation({
+    id: TEST_CONVERSATION_ID,
+    userAId: TEST_USERS.alice,
+    userBId: TEST_USERS.bob,
+  });
 
   let natsClient: { publish: jest.Mock };
   let prisma: {
-    message: { create: jest.Mock; updateMany: jest.Mock };
+    message: {
+      create: jest.Mock;
+      findMany: jest.Mock;
+      findUnique: jest.Mock;
+      update: jest.Mock;
+      updateMany: jest.Mock;
+    };
     conversation: { update: jest.Mock };
   };
   let conversations: { getParticipantConversation: jest.Mock };
@@ -38,21 +46,21 @@ describe('MessagesService integration events', () => {
     natsClient = { publish: jest.fn() };
     prisma = {
       message: {
-        create: jest.fn().mockResolvedValue(messageRow),
+        create: jest.fn().mockResolvedValue(makeMessage({ id: 'msg-1', createdAt })),
+        findMany: jest.fn(),
+        findUnique: jest.fn(),
+        update: jest.fn(),
         updateMany: jest.fn().mockResolvedValue({ count: 3 }),
       },
       conversation: { update: jest.fn().mockResolvedValue({}) },
     };
     conversations = {
-      getParticipantConversation: jest
-        .fn()
-        .mockResolvedValue({ id: conversationId, userAId: 'user-a', userBId: 'user-b' }),
+      getParticipantConversation: jest.fn().mockResolvedValue(conversationRow),
     };
     events = { emit: jest.fn() };
-
-    // Vrai NatsPublisherService, mais avec une connexion NATS mockée.
-    publisher = new NatsPublisherService(natsClient as unknown as NatsConnection);
-
+    publisher = new NatsPublisherService(
+      new OutboxService(natsClient as unknown as NatsConnection),
+    );
     service = new MessagesService(
       prisma as unknown as PrismaService,
       conversations as unknown as ConversationsService,
@@ -61,79 +69,189 @@ describe('MessagesService integration events', () => {
     );
   });
 
-  it('emits the internal message.created event with both participant ids', async () => {
-    await service.send(conversationId, 'user-a', { content: 'hello' });
+  describe('send', () => {
+    it('creates the message and emits the internal message.created event with both participant ids', async () => {
+      await service.send(TEST_CONVERSATION_ID, TEST_USERS.alice, { content: 'hello' });
 
-    expect(events.emit).toHaveBeenCalledWith('message.created', {
-      conversationId,
-      participantIds: ['user-a', 'user-b'],
-      message: messageRow,
+      expect(prisma.message.create).toHaveBeenCalledTimes(1);
+      expect(events.emit).toHaveBeenCalledWith(
+        'message.created',
+        expect.objectContaining({
+          conversationId: TEST_CONVERSATION_ID,
+          participantIds: [TEST_USERS.alice, TEST_USERS.bob],
+        }),
+      );
+    });
+
+    it('publishes messaging.message.created (without content) after the DB write', async () => {
+      const publishSpy = jest.spyOn(publisher, 'publish');
+
+      await service.send(TEST_CONVERSATION_ID, TEST_USERS.alice, { content: 'hello' });
+
+      expect(publishSpy).toHaveBeenCalledWith('messaging.message.created', {
+        messageId: 'msg-1',
+        conversationId: TEST_CONVERSATION_ID,
+        senderId: TEST_USERS.alice,
+        createdAt,
+      });
+      expect(natsClient.publish).toHaveBeenCalledWith(
+        'messaging.message.created',
+        expect.anything(),
+      );
+      expect(prisma.message.create.mock.invocationCallOrder[0]).toBeLessThan(
+        publishSpy.mock.invocationCallOrder[0],
+      );
+    });
+
+    it('does not fail the send when NATS publish throws (best-effort via outbox)', async () => {
+      natsClient.publish.mockImplementation(() => {
+        throw new Error('nats down');
+      });
+
+      await expect(
+        service.send(TEST_CONVERSATION_ID, TEST_USERS.alice, { content: 'hello' }),
+      ).resolves.toMatchObject({ id: 'msg-1' });
+    });
+
+    it('rejects an empty content (defense in depth)', async () => {
+      await expect(
+        service.send(TEST_CONVERSATION_ID, TEST_USERS.alice, { content: '   ' }),
+      ).rejects.toThrow();
+      expect(prisma.message.create).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('paginate', () => {
+    it('returns a stable page and a nextCursor when more rows exist', async () => {
+      // limit 2 -> le service demande 3 lignes ; 3 renvoyées => il reste une page.
+      const rows = [
+        makeMessage({ id: 'm3' }),
+        makeMessage({ id: 'm2' }),
+        makeMessage({ id: 'm1' }),
+      ];
+      prisma.message.findMany.mockResolvedValue(rows);
+
+      const page = await service.paginate(TEST_CONVERSATION_ID, TEST_USERS.alice, undefined, 2);
+
+      expect(prisma.message.findMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          take: 3,
+          orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+        }),
+      );
+      expect(page.items.map((m) => m.id)).toEqual(['m3', 'm2']);
+      expect(page.nextCursor).toBe('m2');
+    });
+
+    it('returns nextCursor null on the last page', async () => {
+      prisma.message.findMany.mockResolvedValue([
+        makeMessage({ id: 'm2' }),
+        makeMessage({ id: 'm1' }),
+      ]);
+
+      const page = await service.paginate(TEST_CONVERSATION_ID, TEST_USERS.alice, undefined, 5);
+
+      expect(page.items).toHaveLength(2);
+      expect(page.nextCursor).toBeNull();
+    });
+
+    it('clamps an oversized limit to 100', async () => {
+      prisma.message.findMany.mockResolvedValue([]);
+
+      await service.paginate(TEST_CONVERSATION_ID, TEST_USERS.alice, undefined, 100_000);
+
+      expect(prisma.message.findMany).toHaveBeenCalledWith(expect.objectContaining({ take: 101 }));
+    });
+
+    it('passes the cursor through with skip: 1', async () => {
+      prisma.message.findMany.mockResolvedValue([]);
+
+      await service.paginate(TEST_CONVERSATION_ID, TEST_USERS.alice, 'cursor-id', 10);
+
+      expect(prisma.message.findMany).toHaveBeenCalledWith(
+        expect.objectContaining({ cursor: { id: 'cursor-id' }, skip: 1 }),
+      );
+    });
+  });
+
+  describe('markRead', () => {
+    it('throws NotFoundException for an unknown message', async () => {
+      prisma.message.findUnique.mockResolvedValue(null);
+
+      await expect(service.markRead('missing', TEST_USERS.bob)).rejects.toBeInstanceOf(
+        NotFoundException,
+      );
+    });
+
+    it('forbids the sender from marking their own message as read', async () => {
+      prisma.message.findUnique.mockResolvedValue(makeMessage({ senderId: TEST_USERS.alice }));
+
+      await expect(service.markRead('msg-1', TEST_USERS.alice)).rejects.toBeInstanceOf(
+        ForbiddenException,
+      );
+      expect(prisma.message.update).not.toHaveBeenCalled();
+    });
+
+    it('is idempotent: an already-read message is returned as-is, no event, no update', async () => {
+      const alreadyRead = makeMessage({ senderId: TEST_USERS.alice, readAt: createdAt });
+      prisma.message.findUnique.mockResolvedValue(alreadyRead);
+
+      const result = await service.markRead('msg-1', TEST_USERS.bob);
+
+      expect(result).toBe(alreadyRead);
+      expect(prisma.message.update).not.toHaveBeenCalled();
+      expect(events.emit).not.toHaveBeenCalled();
+    });
+
+    it('marks an unread received message as read and emits message.read', async () => {
+      prisma.message.findUnique.mockResolvedValue(
+        makeMessage({ id: 'msg-1', senderId: TEST_USERS.alice, readAt: null }),
+      );
+      const readAt = new Date('2026-09-08T12:00:00.000Z');
+      prisma.message.update.mockResolvedValue(
+        makeMessage({ id: 'msg-1', senderId: TEST_USERS.alice, readAt }),
+      );
+
+      const result = await service.markRead('msg-1', TEST_USERS.bob);
+
+      expect(prisma.message.update).toHaveBeenCalledWith(
+        expect.objectContaining({ where: { id: 'msg-1' } }),
+      );
+      expect(events.emit).toHaveBeenCalledWith(
+        'message.read',
+        expect.objectContaining({ messageId: 'msg-1', readBy: TEST_USERS.bob }),
+      );
+      expect(result.readAt).toEqual(readAt);
     });
   });
 
   describe('markConversationRead', () => {
     it('bulk-marks received unread messages and emits conversation.read', async () => {
-      const result = await service.markConversationRead(conversationId, 'user-b');
+      const result = await service.markConversationRead(TEST_CONVERSATION_ID, TEST_USERS.bob);
 
       expect(prisma.message.updateMany).toHaveBeenCalledWith(
         expect.objectContaining({
-          where: { conversationId, senderId: { not: 'user-b' }, readAt: null },
+          where: {
+            conversationId: TEST_CONVERSATION_ID,
+            senderId: { not: TEST_USERS.bob },
+            readAt: null,
+          },
         }),
       );
       expect(result).toEqual({ updated: 3 });
       expect(events.emit).toHaveBeenCalledWith(
         'conversation.read',
-        expect.objectContaining({
-          conversationId,
-          participantIds: ['user-a', 'user-b'],
-          readBy: 'user-b',
-          count: 3,
-        }),
+        expect.objectContaining({ conversationId: TEST_CONVERSATION_ID, count: 3 }),
       );
     });
 
     it('is a no-op (no event) when nothing was unread', async () => {
       prisma.message.updateMany.mockResolvedValueOnce({ count: 0 });
 
-      const result = await service.markConversationRead(conversationId, 'user-b');
+      const result = await service.markConversationRead(TEST_CONVERSATION_ID, TEST_USERS.bob);
 
       expect(result).toEqual({ updated: 0 });
       expect(events.emit).not.toHaveBeenCalled();
     });
-  });
-
-  it('publishes messaging.message.created after the message is written', async () => {
-    const publishSpy = jest.spyOn(publisher, 'publish');
-
-    await service.send(conversationId, 'user-a', { content: 'hello' });
-
-    expect(prisma.message.create).toHaveBeenCalledTimes(1);
-
-    // Bon sujet + payload sans `content`.
-    expect(publishSpy).toHaveBeenCalledWith('messaging.message.created', {
-      messageId: 'msg-1',
-      conversationId,
-      senderId: 'user-a',
-      createdAt,
-    });
-
-    // Le client NATS mocké a bien reçu l'appel.
-    expect(natsClient.publish).toHaveBeenCalledTimes(1);
-    expect(natsClient.publish).toHaveBeenCalledWith('messaging.message.created', expect.anything());
-
-    // Ordre : la publication vient APRÈS l'écriture Prisma.
-    expect(prisma.message.create.mock.invocationCallOrder[0]).toBeLessThan(
-      publishSpy.mock.invocationCallOrder[0],
-    );
-  });
-
-  it('does not fail the send when NATS publish throws (best-effort)', async () => {
-    natsClient.publish.mockImplementation(() => {
-      throw new Error('nats down');
-    });
-
-    await expect(service.send(conversationId, 'user-a', { content: 'hello' })).resolves.toEqual(
-      messageRow,
-    );
   });
 });
