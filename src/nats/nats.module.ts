@@ -1,6 +1,8 @@
 import { Global, Module } from '@nestjs/common';
 import { NatsPublisherService } from './nats-publisher.service';
+import { NATS_CONNECTION } from './nats.constants';
 import { natsConnectionProvider } from './nats.provider';
+import { OutboxService } from './outbox.service';
 
 /**
  * Possède la connexion NATS et expose NatsPublisherService.
@@ -14,7 +16,8 @@ import { natsConnectionProvider } from './nats.provider';
  */
 @Global()
 @Module({
-  providers: [natsConnectionProvider, NatsPublisherService],
-  exports: [NatsPublisherService],
+  providers: [natsConnectionProvider, OutboxService, NatsPublisherService],
+  // NATS_CONNECTION est exporté pour le healthcheck (GET /health).
+  exports: [NatsPublisherService, NATS_CONNECTION],
 })
 export class NatsModule {}
