@@ -25,8 +25,10 @@ const NATS_URL = process.env.MESSAGING_NATS_URL ?? 'nats://localhost:4222';
 const PORT = process.env.PORT ?? '3100';
 const BASE_URL = `http://localhost:${PORT}`;
 
-const USER_A = 'smoke-user-a';
-const USER_B = 'smoke-user-b';
+// Identifiants au format UUID (le service valide `participantId` avec @IsUUID).
+// Fixes et déterministes : une 2e exécution retombe sur la même conversation.
+const USER_A = '5170a11e-0000-4000-8000-00000000000a';
+const USER_B = '5170a11e-0000-4000-8000-00000000000b';
 const RT_TIMEOUT_MS = 2000;
 
 // --------------------------------------------------------------------------- //
