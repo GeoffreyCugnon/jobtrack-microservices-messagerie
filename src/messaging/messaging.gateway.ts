@@ -1,4 +1,4 @@
-import { Logger, OnModuleDestroy, OnModuleInit, UsePipes, ValidationPipe } from '@nestjs/common';
+import { Logger, UsePipes, ValidationPipe } from '@nestjs/common';
 import { OnEvent } from '@nestjs/event-emitter';
 import {
   ConnectedSocket,
@@ -22,10 +22,9 @@ import {
   MessageReadEvent,
 } from '../common/events';
 import { corsOriginCheck } from '../common/cors';
-import { WS_CONNECT_THROTTLE, WS_SEND_THROTTLE } from '../common/rate-limit.constants';
 import { MessagesService } from '../messages/messages.service';
 import { WsConversationDto, WsSendMessageDto } from './dto/ws-messages.dto';
-import { SlidingWindowRateLimiter } from './ws-rate-limit';
+import { WsRateLimiterService } from './rate-limiter.service';
 
 /** Nom de la room Socket.IO pour une conversation donnée. */
 const room = (conversationId: string): string => `conversation:${conversationId}`;
@@ -58,23 +57,8 @@ const ipOf = (client: Socket): string =>
  */
 @UsePipes(new ValidationPipe({ whitelist: true, transform: true }))
 @WebSocketGateway({ cors: { origin: corsOriginCheck } })
-export class MessagingGateway implements OnGatewayConnection, OnModuleInit, OnModuleDestroy {
+export class MessagingGateway implements OnGatewayConnection {
   private readonly logger = new Logger(MessagingGateway.name);
-
-  /** Tentatives de connexion (handshake) par IP. */
-  private readonly connectLimiter = new SlidingWindowRateLimiter(
-    WS_CONNECT_THROTTLE.limit,
-    WS_CONNECT_THROTTLE.windowMs,
-  );
-
-  /** Événements `message:send` par utilisateur. */
-  private readonly sendLimiter = new SlidingWindowRateLimiter(
-    WS_SEND_THROTTLE.limit,
-    WS_SEND_THROTTLE.windowMs,
-  );
-
-  /** Purge périodique des deux limiteurs (évite la fuite mémoire sur clés inactives). */
-  private sweepTimer?: ReturnType<typeof setInterval>;
 
   @WebSocketServer()
   server!: Server;
@@ -82,23 +66,8 @@ export class MessagingGateway implements OnGatewayConnection, OnModuleInit, OnMo
   constructor(
     private readonly authService: AuthService,
     private readonly messages: MessagesService,
+    private readonly rateLimiter: WsRateLimiterService,
   ) {}
-
-  onModuleInit(): void {
-    // Fenêtre de connexion = la plus large : suffisant pour purger les deux.
-    this.sweepTimer = setInterval(() => {
-      this.connectLimiter.sweep();
-      this.sendLimiter.sweep();
-    }, WS_CONNECT_THROTTLE.windowMs);
-    // Ne pas maintenir le process en vie juste pour ce timer.
-    this.sweepTimer.unref?.();
-  }
-
-  onModuleDestroy(): void {
-    if (this.sweepTimer) {
-      clearInterval(this.sweepTimer);
-    }
-  }
 
   /**
    * Les guards ne s'exécutent pas sur l'événement de connexion : on valide donc
@@ -107,8 +76,8 @@ export class MessagingGateway implements OnGatewayConnection, OnModuleInit, OnMo
   handleConnection(client: Socket): void {
     // Rate limit du handshake, par IP : coupe un flood de connexions avant
     // même la vérification JWT.
-    if (!this.connectLimiter.hit(ipOf(client))) {
-      this.logger.warn(`Rejected socket ${client.id}: connection rate limit for ${ipOf(client)}`);
+    if (!this.rateLimiter.allowConnection(ipOf(client))) {
+      this.logger.warn(`Rejected socket ${client.id}: connection rate limit`);
       client.disconnect(true);
       return;
     }
@@ -150,7 +119,7 @@ export class MessagingGateway implements OnGatewayConnection, OnModuleInit, OnMo
       // Filet de sécurité : ne devrait pas arriver, handleConnection ayant déjà rejeté.
       throw new WsException('Unauthorized');
     }
-    if (!this.sendLimiter.hit(user.id)) {
+    if (!this.rateLimiter.allowMessage(user.id, client.id)) {
       throw new WsException('Message rate limit exceeded, slow down');
     }
     return this.messages.send(body.conversationId, user.id, {
