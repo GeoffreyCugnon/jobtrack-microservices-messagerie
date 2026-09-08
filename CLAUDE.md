@@ -23,42 +23,27 @@ Version : 0.1.0
 
 ---
 
-## 0. Corrections appliquées
+## 0. État des corrections Phase 1 — ✅ COMPLÈTE (2026-09-08)
 
-### Phase 1 — Sprint d'urgence (2026-09-08)
+`npm run build` ✓ · `npm run lint` ✓ · `npm run format` ✓ · `npm test` 22 ✓ · `npm run test:e2e` 6 ✓
 
-Suit `PROMPT_FIX_AUDIT.md`. Le code avait déjà partiellement évolué depuis
-l'audit du 2025-09-08 (`ListMessagesQueryDto` bornait déjà `limit` à 1–100 avec
-`@IsUUID` sur le curseur ; `main.ts` rejetait déjà les origines non-localhost).
+| Item | Statut | Détail |
+|------|--------|--------|
+| **P1 — CORS** | ✅ DONE | Liste blanche explicite unique, partagée HTTP + Socket.IO (`src/common/cors.ts`, `corsOriginCheck`), pilotée par `MESSAGING_CORS_ORIGINS` (défaut : origines Vite `localhost:5173/5174`). Plus de `origin: '*'` sur la gateway ni de regex « tout port localhost » dans `main.ts`. |
+| **P2 — Rate limiting** | ✅ DONE | REST : `@nestjs/throttler` v6 câblé dans `AppModule` (`ThrottlerModule.forRoot`) + `RestThrottlerGuard` en `APP_GUARD` **avant** `AppAuthGuard`, no-op hors HTTP. WS : `SlidingWindowRateLimiter` (mémoire, sans dépendance) dans `MessagingGateway` — `message:send` 5/10 s par user, handshake 10/60 s par IP. Tout surchargeable par env. Défauts plus permissifs que l'audit (voir §9.1) — écart assumé, valeurs de l'audit documentées dans `.env.example`. |
+| **P3 — Validation DTO** | ✅ DONE | `CreateConversationDto.participantId` → `@IsUUID()`. `content` borné à 5 000 (`SendMessageDto` + `WsSendMessageDto`). `metadata` plafonné à 10 000 octets sérialisés (`@MaxJsonSize`, `src/common/max-json-size.validator.ts`). `ListMessagesQueryDto` était déjà conforme. |
 
-- **🔴 → ✅ P1 CORS.** Liste blanche explicite et unique, partagée HTTP + Socket.IO :
-  `src/common/cors.ts` (`corsOriginCheck`), pilotée par `MESSAGING_CORS_ORIGINS`
-  (défaut : origines Vite `localhost:5173/5174`). Fin du `cors: { origin: '*' }`
-  de la gateway et de la regex « tout port localhost » de `main.ts`.
-- **🔴 → ✅ P2 Rate limiting.** REST : `@nestjs/throttler` v6 + `RestThrottlerGuard`
-  (`APP_GUARD`, no-op hors HTTP), défaut 100 req / 60 s par IP. WebSocket :
-  `SlidingWindowRateLimiter` (en mémoire, sans dépendance) dans `MessagingGateway`
-  — `message:send` 5 / 10 s par utilisateur, handshake 10 / 60 s par IP. Tout est
-  surchargeable par env (`MESSAGING_REST_THROTTLE_*`, `MESSAGING_WS_SEND_*`,
-  `MESSAGING_WS_CONNECT_*`). **Écart assumé vs audit** : les défauts sont plus
-  permissifs que les valeurs de l'audit (REST 10/60 s, WS connexion 3/60 s), qui
-  rendraient l'UI inutilisable et casseraient les cycles de reconnexion ; les
-  valeurs de l'audit restent documentées dans `.env.example`. `redis` **non**
-  installé (modèle mono-instance isolée ⇒ store mémoire suffisant).
-- **🟠 → ✅ P3 Validation DTO.** `CreateConversationDto.participantId` → `@IsUUID()`
-  (le service manipule des UUID partout ; JobTrack émet des `sub` UUID).
-  `SendMessageDto` / `WsSendMessageDto` : `content` 10 000 → **5 000** caractères,
-  `metadata` plafonné à 10 000 octets sérialisés via `@MaxJsonSize()`
-  (`src/common/max-json-size.validator.ts`). `ListMessagesQueryDto` était déjà
-  conforme. Pipe e2e aligné sur `main.ts` (`forbidNonWhitelisted: true`).
-- **Tests ajoutés** : `src/common/cors.spec.ts`, `src/common/max-json-size.validator.spec.ts`,
-  `src/messaging/ws-rate-limit.spec.ts`, + e2e (400 sur `participantId` non-UUID
-  et propriété inconnue, 429 sur flood REST). `npm test` : 22 ✓ ; `npm run test:e2e` : 6 ✓.
-- **Non fait** (Phase 2, `PROMPT_FIX_AUDIT.md`) : P4 tests unitaires core services,
-  P5 pagination `listForUser`, P6 chiffrement `content` au repos. Intouché comme
-  demandé : `prisma/schema.prisma`, `nats-publisher.service.ts`, `src/generated/*`.
-- **Note infra** : le dossier n'est pas un dépôt Git → aucun commit créé
-  (les libellés de commit du prompt sont dans ce récap).
+**Les 5 « blockers » d'un plan de reprise ultérieur étaient déjà résolus** (état réel du repo ≠ snapshot de l'audit) :
+
+1. `src/nats/nats.provider.ts` — existe (`natsConnectionProvider`, best-effort, renvoie `null` si NATS injoignable).
+2. `src/messaging/dto/ws-messages.dto.ts` — existe (`WsConversationDto`, `WsSendMessageDto`, bornes alignées sur le chemin REST).
+3. `ThrottlerModule` — câblé dans `AppModule` (cf. P2).
+4. CORS WebSocket — restreint (cf. P1).
+5. Migrations Prisma — `prisma/migrations/20250101000000_init/` (tables + FK + index composite + `@@unique`) et `20250101000100_unread_messages_partial_index/` (index partiel `WHERE "readAt" IS NULL`).
+
+**Tests ajoutés** : `src/common/cors.spec.ts`, `src/common/max-json-size.validator.spec.ts`, `src/messaging/ws-rate-limit.spec.ts`, + e2e (400 sur `participantId` non-UUID / propriété inconnue, 429 sur flood REST).
+
+**Phase 2 (à faire)** : P4 tests unitaires core services (`conversations.service`, `messages.service`), P5 pagination `listForUser`, P6 chiffrement `Message.content` au repos. Intouché comme demandé : `prisma/schema.prisma`, `nats-publisher.service.ts`, `src/generated/*`.
 
 ---
 
