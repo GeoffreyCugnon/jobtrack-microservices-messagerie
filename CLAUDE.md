@@ -45,7 +45,7 @@ Version : 0.1.0
 
 ---
 
-## 0 bis. Phase 2 — tests + fiabilité (2026-09-08, branche `feature/phase2-tests`)
+## 0 bis. Phase 2 — tests + fiabilité (2026-09-08, sur `develop`)
 
 `npm run build` ✓ · `npm run lint` ✓ · `npm run format` ✓ · `npm test` **60 ✓** · `npm run test:e2e` **7 ✓** · coverage **64 % stmts / 55 % branches / 66 % funcs / 66 % lines** (cible 50 %).
 
