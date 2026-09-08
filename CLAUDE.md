@@ -43,7 +43,20 @@ Version : 0.1.0
 
 **Tests ajoutés** : `src/common/cors.spec.ts`, `src/common/max-json-size.validator.spec.ts`, `src/messaging/ws-rate-limit.spec.ts`, + e2e (400 sur `participantId` non-UUID / propriété inconnue, 429 sur flood REST).
 
-**Phase 2 (à faire)** : P4 tests unitaires core services (`conversations.service`, `messages.service`), P5 pagination `listForUser`, P6 chiffrement `Message.content` au repos. Intouché comme demandé : `prisma/schema.prisma`, `nats-publisher.service.ts`, `src/generated/*`.
+---
+
+## 0 bis. Phase 2 — tests + fiabilité (2026-09-08, branche `feature/phase2-tests`)
+
+`npm run build` ✓ · `npm run lint` ✓ · `npm run format` ✓ · `npm test` **60 ✓** · `npm run test:e2e` **7 ✓** · coverage **64 % stmts / 55 % branches / 66 % funcs / 66 % lines** (cible 50 %).
+
+| Sprint | Livrable | Détail |
+|--------|----------|--------|
+| **1 — Tests** | ✅ | Fixtures `src/common/test-fixtures.ts` (`TEST_USERS`, `makeConversation`, `makeMessage`). Nouvelles specs : `conversations.service.spec.ts` (findOrCreate happy/existante/P2002/rethrow, listForUser unreadCount, self-check), `messaging.gateway.spec.ts` (handleConnection valide/invalide/rate-limité, join/leave, message:send). Étendues : `messages.service.spec.ts` (paginate curseur + clamp, markRead idempotent/authz/reject-own), `app-auth.guard.spec.ts` (token expiré, court-circuit `@Public()`). |
+| **2a — Rate limit WS** | ✅ | `SlidingWindowRateLimiter` (inchangé) extrait dans un provider injectable `WsRateLimiterService` (`src/messaging/rate-limiter.service.ts`) : `allowConnection(ip)` + `allowMessage(userId, socketId)` avec repli `socket:<id>`. Injecté dans `MessagingGateway` ; le timer de purge vit dans le service. |
+| **2b — Fiabilité NATS** | ✅ (in-memory) | `OutboxService` (`src/nats/outbox.service.ts`) : file en mémoire, publication immédiate puis retry backoff **1 s → 5 s → 30 s** (max 3 retries) + job de drain toutes les 30 s, garde-fou `MAX_PENDING`. `NatsPublisherService` délègue désormais à `OutboxService` (au lieu de publier en direct). **⚠️ Non durable** : un crash perd la file — l'outbox transactionnel (table Prisma dans la transaction du message) reste Phase 3. |
+| **3 — Sécurité** | ✅ | `GET /health` public (`@Public()` + `@SkipThrottle()`) → `{ status, database, nats }`, sonde Prisma `SELECT 1` avec timeout 1 s. `@Public()` géré par `AppAuthGuard` via `Reflector`. Défense en profondeur : `assertUuid` / `assertMessageContent` (`src/common/assert.ts`) dans `ConversationsService.findOrCreate` et `MessagesService.send` ; `paginate` clampe `limit` à 100 côté service. |
+
+**Toujours ouvert (Phase 3)** : outbox transactionnel durable (table `OutboxEvent`), chiffrement `Message.content` au repos (P6), pagination de `listForUser`. Intouché : `prisma/schema.prisma`, `src/generated/*`.
 
 ---
 
