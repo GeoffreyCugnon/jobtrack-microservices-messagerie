@@ -8,3 +8,6 @@ src/generated/
 
 # Local download copy of files sent via SendUserFile (see JobTrack/CLAUDE.md).
 Claude outputs/
+
+# Per-developer Claude Code settings (shared settings.json stays tracked).
+.claude/settings.local.json
