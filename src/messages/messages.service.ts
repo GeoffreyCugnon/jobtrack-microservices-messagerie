@@ -10,6 +10,7 @@ import {
   MessageCreatedEvent,
   MessageReadEvent,
 } from '../common/events';
+import { ContentCipherService } from '../common/content-cipher.service';
 import { ConversationsService } from '../conversations/conversations.service';
 import { OutboxService } from '../nats/outbox.service';
 import { NATS_SUBJECTS } from '../nats/nats.events';
@@ -45,7 +46,13 @@ export class MessagesService {
     private readonly conversations: ConversationsService,
     private readonly events: EventEmitter2,
     private readonly outbox: OutboxService,
+    private readonly cipher: ContentCipherService,
   ) {}
+
+  /** Renvoie une copie du message avec `content` déchiffré (lecture). */
+  private decrypted(message: Message): Message {
+    return { ...message, content: this.cipher.decrypt(message.content) };
+  }
 
   /**
    * Émission de l'événement interne (fan-out WebSocket) en mode best-effort :
@@ -99,7 +106,7 @@ export class MessagesService {
     });
 
     const hasMore = rows.length === take;
-    const items = hasMore ? rows.slice(0, safeLimit) : rows;
+    const items = (hasMore ? rows.slice(0, safeLimit) : rows).map((m) => this.decrypted(m));
     return { items, nextCursor: hasMore ? items[items.length - 1].id : null };
   }
 
@@ -116,10 +123,11 @@ export class MessagesService {
     );
 
     // `metadata` n'est posé que s'il est fourni (évite d'écrire `null` explicitement).
+    // `content` est chiffré au repos si une clé est configurée (no-op sinon).
     const data: Prisma.MessageUncheckedCreateInput = {
       conversationId,
       senderId,
-      content: dto.content,
+      content: this.cipher.encrypt(dto.content),
     };
     if (dto.metadata !== undefined) {
       data.metadata = dto.metadata as Prisma.InputJsonValue;
@@ -142,16 +150,20 @@ export class MessagesService {
 
     this.safeWake();
 
+    // Les clients (REST + WebSocket) reçoivent toujours le contenu en clair ;
+    // seul le stockage est chiffré.
+    const plain: Message = { ...message, content: dto.content };
+
     // Événement interne -> diffusion WebSocket (room de la conversation pour le
     // fil ouvert + rooms `user:<id>` des deux participants pour rafraîchir leur
     // liste, même conversation fermée).
     this.safeEmit(MESSAGE_CREATED, {
       conversationId,
       participantIds: [conversation.userAId, conversation.userBId],
-      message,
+      message: plain,
     } satisfies MessageCreatedEvent);
 
-    return message;
+    return plain;
   }
 
   /**
@@ -174,7 +186,7 @@ export class MessagesService {
       throw new ForbiddenException('The sender cannot mark their own message as read');
     }
     if (message.readAt) {
-      return message;
+      return this.decrypted(message);
     }
 
     const updated = await this.prisma.$transaction(async (tx) => {
@@ -201,7 +213,7 @@ export class MessagesService {
       readBy: userId,
     } satisfies MessageReadEvent);
 
-    return updated;
+    return this.decrypted(updated);
   }
 
   /**

@@ -6,6 +6,7 @@ import {
   makeConversation,
   makeMessage,
 } from '../common/test-fixtures';
+import type { ContentCipherService } from '../common/content-cipher.service';
 import { ConversationsService } from '../conversations/conversations.service';
 import type { OutboxService } from '../nats/outbox.service';
 import { PrismaService } from '../prisma/prisma.service';
@@ -39,6 +40,7 @@ describe('MessagesService', () => {
   let conversations: { getParticipantConversation: jest.Mock };
   let events: { emit: jest.Mock };
   let outbox: { enqueueInTx: jest.Mock; wake: jest.Mock };
+  let cipher: { encrypt: jest.Mock; decrypt: jest.Mock };
   let service: MessagesService;
 
   beforeEach(() => {
@@ -58,11 +60,17 @@ describe('MessagesService', () => {
     };
     events = { emit: jest.fn() };
     outbox = { enqueueInTx: jest.fn().mockResolvedValue({ id: 'evt' }), wake: jest.fn() };
+    // Chiffrement : passe-plat par défaut (préfixe visible pour vérifier l'appel).
+    cipher = {
+      encrypt: jest.fn((s: string) => `enc(${s})`),
+      decrypt: jest.fn((s: string) => s.replace(/^enc\((.*)\)$/, '$1')),
+    };
     service = new MessagesService(
       prisma as unknown as PrismaService,
       conversations as unknown as ConversationsService,
       events as unknown as EventEmitter2,
       outbox as unknown as OutboxService,
+      cipher as unknown as ContentCipherService,
     );
   });
 
@@ -115,6 +123,25 @@ describe('MessagesService', () => {
       ).rejects.toThrow();
       expect(prisma.message.create).not.toHaveBeenCalled();
     });
+
+    it('encrypts content before persisting and returns it in clear', async () => {
+      prisma.message.create.mockResolvedValue(
+        makeMessage({ id: 'msg-1', content: 'enc(hello)', createdAt }),
+      );
+
+      const res = await service.send(TEST_CONVERSATION_ID, TEST_USERS.alice, { content: 'hello' });
+
+      expect(cipher.encrypt).toHaveBeenCalledWith('hello');
+      expect(prisma.message.create).toHaveBeenCalledWith({
+        data: {
+          conversationId: TEST_CONVERSATION_ID,
+          senderId: TEST_USERS.alice,
+          content: 'enc(hello)',
+        },
+      });
+      // Clients get clear text; only storage is encrypted.
+      expect(res.content).toBe('hello');
+    });
   });
 
   describe('paginate', () => {
@@ -137,6 +164,17 @@ describe('MessagesService', () => {
       );
       expect(page.items.map((m) => m.id)).toEqual(['m3', 'm2']);
       expect(page.nextCursor).toBe('m2');
+      expect(cipher.decrypt).toHaveBeenCalled();
+    });
+
+    it('decrypts each returned message content', async () => {
+      prisma.message.findMany.mockResolvedValue([
+        makeMessage({ id: 'm1', content: 'enc(secret)' }),
+      ]);
+
+      const page = await service.paginate(TEST_CONVERSATION_ID, TEST_USERS.alice, undefined, 10);
+
+      expect(page.items[0].content).toBe('secret');
     });
 
     it('returns nextCursor null on the last page', async () => {
@@ -196,13 +234,13 @@ describe('MessagesService', () => {
       expect(prisma.message.update).not.toHaveBeenCalled();
     });
 
-    it('is idempotent: an already-read message is returned as-is, no event, no enqueue', async () => {
+    it('is idempotent: an already-read message is returned (decrypted) as-is, no event, no enqueue', async () => {
       const alreadyRead = makeMessage({ senderId: TEST_USERS.alice, readAt: createdAt });
       prisma.message.findUnique.mockResolvedValue(alreadyRead);
 
       const result = await service.markRead('msg-1', TEST_USERS.bob);
 
-      expect(result).toBe(alreadyRead);
+      expect(result).toEqual(alreadyRead);
       expect(prisma.message.update).not.toHaveBeenCalled();
       expect(events.emit).not.toHaveBeenCalled();
       expect(outbox.enqueueInTx).not.toHaveBeenCalled();

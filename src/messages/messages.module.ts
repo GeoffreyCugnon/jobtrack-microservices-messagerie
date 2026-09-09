@@ -1,4 +1,5 @@
 import { Module } from '@nestjs/common';
+import { ContentCipherService } from '../common/content-cipher.service';
 import { ConversationsModule } from '../conversations/conversations.module';
 import { MessagesController } from './messages.controller';
 import { MessagesService } from './messages.service';
@@ -14,7 +15,7 @@ import { MessagesService } from './messages.service';
 @Module({
   imports: [ConversationsModule],
   controllers: [MessagesController],
-  providers: [MessagesService],
+  providers: [MessagesService, ContentCipherService],
   exports: [MessagesService],
 })
 export class MessagesModule {}
