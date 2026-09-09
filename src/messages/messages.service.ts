@@ -11,7 +11,7 @@ import {
   MessageReadEvent,
 } from '../common/events';
 import { ConversationsService } from '../conversations/conversations.service';
-import { NatsPublisherService } from '../nats/nats-publisher.service';
+import { OutboxService } from '../nats/outbox.service';
 import { NATS_SUBJECTS } from '../nats/nats.events';
 import { PrismaService } from '../prisma/prisma.service';
 import { SendMessageDto } from './dto/send-message.dto';
@@ -30,10 +30,11 @@ export interface MessagePage {
 /**
  * Envoi, lecture et pagination des messages.
  *
- * Après chaque écriture réussie, deux diffusions *best-effort* (aucune ne peut
- * faire échouer la requête) :
+ * Chaque écriture métier s'exécute dans une transaction Prisma qui inclut la
+ * ligne `OutboxEvent` de l'événement d'intégration NATS (outbox durable). Après
+ * commit, deux diffusions best-effort :
  *   - événement interne -> MessagingGateway -> WebSocket (contenu inclus) ;
- *   - événement NATS -> autres micro-services (jamais le contenu).
+ *   - réveil de l'outbox -> publication NATS -> autres micro-services (jamais le contenu).
  */
 @Injectable()
 export class MessagesService {
@@ -43,7 +44,7 @@ export class MessagesService {
     private readonly prisma: PrismaService,
     private readonly conversations: ConversationsService,
     private readonly events: EventEmitter2,
-    private readonly nats: NatsPublisherService,
+    private readonly outbox: OutboxService,
   ) {}
 
   /**
@@ -62,8 +63,18 @@ export class MessagesService {
     }
   }
 
+  /** Réveil de l'outbox, blindé : une écriture métier committée ne doit jamais échouer ici. */
+  private safeWake(): void {
+    try {
+      this.outbox.wake();
+    } catch (err) {
+      this.logger.error(`Failed to wake outbox: ${(err as Error).message}`);
+    }
+  }
+
   /**
-   * Pagination par curseur, message le plus récent en premier.
+   * Pagination par curseur, message le plus récent en premier. Exclut les
+   * messages soft-deletés.
    *
    * On demande `limit + 1` lignes : la ligne excédentaire sert uniquement à
    * savoir s'il reste une page (et à calculer `nextCursor`), elle n'est pas
@@ -80,7 +91,7 @@ export class MessagesService {
     const safeLimit = Math.min(Math.max(Math.trunc(limit) || DEFAULT_PAGE_SIZE, 1), MAX_PAGE_SIZE);
     const take = safeLimit + 1;
     const rows = await this.prisma.message.findMany({
-      where: { conversationId },
+      where: { conversationId, deletedAt: null },
       // `id` en second critère : ordre stable si deux messages ont le même createdAt.
       orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
       take,
@@ -92,7 +103,7 @@ export class MessagesService {
     return { items, nextCursor: hasMore ? items[items.length - 1].id : null };
   }
 
-  /** Crée un message, met à jour `lastMessageAt`, puis diffuse (WebSocket + NATS). */
+  /** Crée un message + `lastMessageAt` + ligne d'outbox dans une transaction, puis diffuse. */
   async send(conversationId: string, senderId: string, dto: SendMessageDto): Promise<Message> {
     // Défense en profondeur : DTO (`@IsUUID`, `@MinLength/@MaxLength`) et
     // `ParseUUIDPipe` valident déjà en amont sur les chemins REST et WS.
@@ -114,11 +125,22 @@ export class MessagesService {
       data.metadata = dto.metadata as Prisma.InputJsonValue;
     }
 
-    const message = await this.prisma.message.create({ data });
-    await this.prisma.conversation.update({
-      where: { id: conversationId },
-      data: { lastMessageAt: message.createdAt },
+    const message = await this.prisma.$transaction(async (tx) => {
+      const created = await tx.message.create({ data });
+      await tx.conversation.update({
+        where: { id: conversationId },
+        data: { lastMessageAt: created.createdAt },
+      });
+      await this.outbox.enqueueInTx(tx, NATS_SUBJECTS.messageCreated, {
+        messageId: created.id,
+        conversationId: created.conversationId,
+        senderId: created.senderId,
+        createdAt: created.createdAt.toISOString(),
+      });
+      return created;
     });
+
+    this.safeWake();
 
     // Événement interne -> diffusion WebSocket (room de la conversation pour le
     // fil ouvert + rooms `user:<id>` des deux participants pour rafraîchir leur
@@ -129,14 +151,6 @@ export class MessagesService {
       message,
     } satisfies MessageCreatedEvent);
 
-    // Événement d'intégration NATS, après l'écriture réussie. Sans `content`.
-    await this.nats.publish(NATS_SUBJECTS.messageCreated, {
-      messageId: message.id,
-      conversationId: message.conversationId,
-      senderId: message.senderId,
-      createdAt: message.createdAt,
-    });
-
     return message;
   }
 
@@ -145,11 +159,11 @@ export class MessagesService {
    *
    * Règles : seul un participant peut le faire, et jamais l'expéditeur lui-même.
    * Idempotent : si le message est déjà lu, on le renvoie tel quel sans réémettre
-   * d'événement.
+   * d'événement. Un message soft-deleté est traité comme introuvable.
    */
   async markRead(messageId: string, userId: string): Promise<Message> {
     const message = await this.prisma.message.findUnique({ where: { id: messageId } });
-    if (!message) {
+    if (!message || message.deletedAt) {
       throw new NotFoundException('Message not found');
     }
     const conversation = await this.conversations.getParticipantConversation(
@@ -163,10 +177,20 @@ export class MessagesService {
       return message;
     }
 
-    const updated = await this.prisma.message.update({
-      where: { id: messageId },
-      data: { readAt: new Date() },
+    const updated = await this.prisma.$transaction(async (tx) => {
+      const row = await tx.message.update({
+        where: { id: messageId },
+        data: { readAt: new Date() },
+      });
+      await this.outbox.enqueueInTx(tx, NATS_SUBJECTS.messageRead, {
+        messageId: row.id,
+        conversationId: row.conversationId,
+        readAt: (row.readAt as Date).toISOString(),
+      });
+      return row;
     });
+
+    this.safeWake();
 
     // Événement interne -> accusé de lecture en WebSocket.
     this.safeEmit(MESSAGE_READ, {
@@ -176,13 +200,6 @@ export class MessagesService {
       readAt: updated.readAt as Date,
       readBy: userId,
     } satisfies MessageReadEvent);
-
-    // Événement d'intégration NATS, après l'écriture réussie.
-    await this.nats.publish(NATS_SUBJECTS.messageRead, {
-      messageId: updated.id,
-      conversationId: updated.conversationId,
-      readAt: updated.readAt as Date,
-    });
 
     return updated;
   }
@@ -200,17 +217,29 @@ export class MessagesService {
     );
 
     const readAt = new Date();
-    const { count } = await this.prisma.message.updateMany({
-      where: { conversationId, senderId: { not: userId }, readAt: null },
-      data: { readAt },
+    const count = await this.prisma.$transaction(async (tx) => {
+      const res = await tx.message.updateMany({
+        where: { conversationId, senderId: { not: userId }, readAt: null, deletedAt: null },
+        data: { readAt },
+      });
+      if (res.count > 0) {
+        // Accusé de lecture agrégé : `messaging.message.read` est unitaire, ce
+        // sujet couvre la lecture en masse (cf. nats.events.ts).
+        await this.outbox.enqueueInTx(tx, NATS_SUBJECTS.conversationRead, {
+          conversationId,
+          readBy: userId,
+          readAt: readAt.toISOString(),
+          count: res.count,
+        });
+      }
+      return res.count;
     });
+
     if (count === 0) {
       return { updated: 0 };
     }
 
-    // Pas de publication NATS ici : le contrat `messaging.message.read` est
-    // par message (un `messageId`), pas par lot. Les consommateurs externes qui
-    // ont besoin du détail passent par `markRead` unitaire.
+    this.safeWake();
 
     // Événement interne -> WebSocket (room de la conversation + rooms perso).
     this.safeEmit(CONVERSATION_READ, {

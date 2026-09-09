@@ -18,20 +18,31 @@ process.env.MESSAGING_REST_THROTTLE_TTL_MS = '60000';
 
 // (imports volontairement placés après les process.env ci-dessus)
 import { AppModule } from '../src/app.module';
-import { NATS_CONNECTION } from '../src/nats/nats.constants';
+import { NatsConnectionManager } from '../src/nats/nats-connection.manager';
 import { PrismaService } from '../src/prisma/prisma.service';
 
 /**
  * Smoke test e2e : le squelette démarre, le guard commun est bien câblé sur
  * chaque route REST, la validation des DTO rejette (400) un payload invalide, et
- * le throttler REST rejette (429) un flood. Prisma et NATS sont mockés — aucun
- * conteneur requis.
+ * le rate limiting REST rejette (429) un flood. Prisma et NATS sont mockés —
+ * aucun conteneur requis.
  */
 const prismaMock = {
   $connect: jest.fn().mockResolvedValue(undefined),
   $disconnect: jest.fn().mockResolvedValue(undefined),
   $queryRaw: jest.fn().mockResolvedValue([{ result: 1 }]),
+  $transaction: jest.fn(),
   conversation: { findMany: jest.fn().mockResolvedValue([]) },
+  outboxEvent: { count: jest.fn().mockResolvedValue(0), findMany: jest.fn().mockResolvedValue([]) },
+};
+prismaMock.$transaction.mockImplementation((cb: (tx: unknown) => unknown) => cb(prismaMock));
+
+/** NATS jamais joignable dans ce test : l'outbox devient un no-op. */
+const natsManagerStub = {
+  connection: null,
+  status: 'down' as const,
+  onModuleInit: jest.fn(),
+  onModuleDestroy: jest.fn(),
 };
 
 describe('Messaging skeleton (e2e)', () => {
@@ -45,8 +56,8 @@ describe('Messaging skeleton (e2e)', () => {
       .overrideProvider(PrismaService)
       .useValue(prismaMock)
       // Pas de broker dans le smoke test : la publication devient un no-op.
-      .overrideProvider(NATS_CONNECTION)
-      .useValue(null)
+      .overrideProvider(NatsConnectionManager)
+      .useValue(natsManagerStub)
       .compile();
 
     app = moduleRef.createNestApplication();
@@ -99,8 +110,14 @@ describe('Messaging skeleton (e2e)', () => {
   it('serves GET /health publicly (no JWT) with a status report', async () => {
     const res = await request(http()).get('/health').expect(200);
 
-    expect(res.body).toMatchObject({ status: 'ok', database: 'ok', nats: 'disabled' });
+    expect(res.body).toMatchObject({
+      status: 'ok',
+      database: 'ok',
+      nats: 'down',
+      outboxPending: 0,
+    });
     expect(prismaMock.$queryRaw).toHaveBeenCalled();
+    expect(prismaMock.outboxEvent.count).toHaveBeenCalled();
   });
 
   it('returns 429 Too Many Requests once the REST throttle limit is exceeded', async () => {

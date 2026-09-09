@@ -30,6 +30,7 @@ export function makeConversation(overrides: Partial<Conversation> = {}): Convers
     userBId: TEST_USERS.bob,
     lastMessageAt: null,
     createdAt: FIXED_NOW,
+    deletedAt: null,
     metadata: null,
     ...overrides,
   };
@@ -43,6 +44,9 @@ export function makeMessage(overrides: Partial<Message> = {}): Message {
     senderId: TEST_USERS.alice,
     content: 'hello',
     readAt: null,
+    deletedAt: null,
+    editedAt: null,
+    editCount: 0,
     createdAt: FIXED_NOW,
     metadata: null,
     ...overrides,

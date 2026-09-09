@@ -1,126 +1,158 @@
-import { Inject, Injectable, Logger, OnModuleDestroy, OnModuleInit } from '@nestjs/common';
-import { JSONCodec, NatsConnection } from 'nats';
-import { NATS_CONNECTION } from './nats.constants';
+import { Injectable, Logger, OnModuleDestroy, OnModuleInit } from '@nestjs/common';
+import { JSONCodec } from 'nats';
+import { OutboxEvent, Prisma } from '../generated/prisma/client';
+import { PrismaService } from '../prisma/prisma.service';
+import { NatsConnectionManager } from './nats-connection.manager';
 
-/** Backoff avant chaque nouvelle tentative, en ms (1 s → 5 s → 30 s). */
-const RETRY_BACKOFF_MS = [1_000, 5_000, 30_000] as const;
-/** Tentatives totales : 1 immédiate + `RETRY_BACKOFF_MS.length` retries. */
-const MAX_ATTEMPTS = 1 + RETRY_BACKOFF_MS.length;
-/** Fréquence du job qui rejoue les entrées dont l'échéance de retry est atteinte. */
-const DRAIN_INTERVAL_MS = 30_000;
-/** Garde-fou mémoire : au-delà, on abandonne les nouveaux événements. */
-const MAX_PENDING = 10_000;
-
-interface OutboxEntry {
-  id: number;
-  subject: string;
-  payload: unknown;
-  attempts: number;
-  /** Timestamp (ms) à partir duquel la prochaine tentative est permise. */
-  nextAttemptAt: number;
-}
+/** Backoff avant chaque nouvelle tentative, en ms. `length` = nombre de retries. */
+const RETRY_BACKOFF_MS = [1_000, 5_000, 15_000, 60_000, 300_000] as const;
+/** Fréquence du job de drain. Surchargeable par env. */
+const DRAIN_INTERVAL_MS = (() => {
+  const n = Number(process.env.MESSAGING_OUTBOX_DRAIN_MS);
+  return Number.isFinite(n) && n > 0 ? Math.floor(n) : 5_000;
+})();
+/** Nombre de lignes traitées par passe de drain. */
+const DRAIN_BATCH = 100;
 
 /**
- * File de sortie des événements d'intégration NATS, avec retry à backoff
- * exponentiel.
+ * Outbox **transactionnel durable** pour les événements d'intégration NATS.
  *
- * Chaque événement est mis en file puis publié immédiatement ; en cas d'échec
- * (broker injoignable ou erreur de publication) il reste en file et est rejoué
- * par `drain()` jusqu'à `MAX_ATTEMPTS`, après quoi il est abandonné (loggé).
+ * `enqueueInTx()` insère la ligne `OutboxEvent` dans la MÊME transaction Prisma
+ * que l'écriture métier : soit les deux commitent, soit aucun. Un crash entre
+ * l'écriture et la publication ne perd donc plus l'événement (l'ancienne file en
+ * mémoire, elle, le perdait — cf. CLAUDE.md §0 ter #1).
  *
- * ⚠️ File **en mémoire** : un crash du process perd les événements non publiés.
- * Une durabilité stricte (table `OutboxEvent` écrite dans la même transaction
- * Prisma que le message) reste un chantier Phase 3 — cf. CLAUDE.md §2.5.
+ * `drain()` (périodique + réveillé par `wake()` après chaque commit) publie les
+ * lignes `publishedAt IS NULL` sur NATS, avec retry à backoff exponentiel. Après
+ * épuisement des tentatives, la ligne est marquée `failedAt` (inspection
+ * manuelle, jamais supprimée). Best-effort de bout en bout : rien ne remonte
+ * vers l'écriture métier.
  */
 @Injectable()
 export class OutboxService implements OnModuleInit, OnModuleDestroy {
   private readonly logger = new Logger(OutboxService.name);
   private readonly codec = JSONCodec();
-  private readonly pending = new Map<number, OutboxEntry>();
-  private seq = 0;
-  private drainTimer?: ReturnType<typeof setInterval>;
+  private timer?: ReturnType<typeof setInterval>;
+  private draining = false;
 
-  constructor(@Inject(NATS_CONNECTION) private readonly connection: NatsConnection | null) {}
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly nats: NatsConnectionManager,
+  ) {}
 
   onModuleInit(): void {
-    this.drainTimer = setInterval(() => this.drain(), DRAIN_INTERVAL_MS);
-    // Ne pas maintenir le process en vie juste pour ce timer.
-    this.drainTimer.unref?.();
+    this.timer = setInterval(() => void this.drain(), DRAIN_INTERVAL_MS);
+    this.timer.unref?.();
+    void this.drain();
   }
 
   async onModuleDestroy(): Promise<void> {
-    if (this.drainTimer) {
-      clearInterval(this.drainTimer);
+    if (this.timer) {
+      clearInterval(this.timer);
     }
-    // Dernière tentative synchrone puis fermeture propre de la connexion.
-    this.drain();
-    if (this.connection) {
-      await this.connection.drain();
-    }
-  }
-
-  /** Nombre d'événements encore en attente de publication (observabilité / tests). */
-  get pendingCount(): number {
-    return this.pending.size;
+    // Dernière passe pour vider ce qui peut l'être avant l'arrêt.
+    await this.drain();
   }
 
   /**
-   * Enfile un événement et tente une publication immédiate. Ne relance jamais
-   * vers l'appelant (best-effort) : l'écriture métier ne doit pas dépendre de NATS.
+   * À appeler **dans** une transaction Prisma, juste après l'écriture métier.
+   * La ligne d'outbox commit atomiquement avec elle.
    */
-  enqueue(subject: string, payload: unknown): void {
-    if (this.pending.size >= MAX_PENDING) {
-      this.logger.error(`Outbox full (${MAX_PENDING} pending), dropping "${subject}"`);
-      return;
-    }
-    const entry: OutboxEntry = {
-      id: ++this.seq,
-      subject,
-      payload,
-      attempts: 0,
-      nextAttemptAt: 0,
-    };
-    this.pending.set(entry.id, entry);
-    this.tryPublish(entry);
+  enqueueInTx(
+    tx: Prisma.TransactionClient,
+    subject: string,
+    payload: Prisma.InputJsonValue,
+  ): Promise<{ id: string }> {
+    return tx.outboxEvent.create({ data: { subject, payload }, select: { id: true } });
   }
 
-  /** Rejoue les entrées dont l'échéance de retry est atteinte. */
-  drain(now: number = Date.now()): void {
-    for (const entry of this.pending.values()) {
-      if (entry.nextAttemptAt <= now) {
-        this.tryPublish(entry, now);
-      }
-    }
+  /** Déclenche un drain immédiat (à appeler après le commit). Ne jette jamais. */
+  wake(): void {
+    void this.drain();
   }
 
-  private tryPublish(entry: OutboxEntry, now: number = Date.now()): void {
-    entry.attempts += 1;
+  /** Événements encore en attente de publication (observabilité / `GET /health`). */
+  countPending(): Promise<number> {
+    return this.prisma.outboxEvent.count({ where: { publishedAt: null, failedAt: null } });
+  }
 
-    if (!this.connection) {
-      this.scheduleOrDrop(entry, now, 'NATS unavailable');
+  async drain(now: Date = new Date()): Promise<void> {
+    if (this.draining) {
       return;
     }
+    this.draining = true;
     try {
-      this.connection.publish(entry.subject, this.codec.encode(entry.payload));
-      this.pending.delete(entry.id);
+      const conn = this.nats.connection;
+      if (!conn) {
+        return; // NATS injoignable : on retentera au prochain tick
+      }
+
+      const batch = await this.prisma.outboxEvent.findMany({
+        where: { publishedAt: null, failedAt: null, nextAttemptAt: { lte: now } },
+        orderBy: { nextAttemptAt: 'asc' },
+        take: DRAIN_BATCH,
+      });
+      if (batch.length === 0) {
+        return;
+      }
+
+      const sent: string[] = [];
+      for (const evt of batch) {
+        try {
+          conn.publish(evt.subject, this.codec.encode(evt.payload));
+          sent.push(evt.id);
+        } catch (err) {
+          await this.reschedule(evt, err);
+        }
+      }
+
+      if (sent.length > 0) {
+        try {
+          // `publish()` est fire-and-forget : `flush()` attend l'ack serveur et
+          // fait remonter une éventuelle erreur AVANT qu'on marque publié.
+          await conn.flush();
+          await this.prisma.outboxEvent.updateMany({
+            where: { id: { in: sent } },
+            data: { publishedAt: new Date(), lastError: null },
+          });
+        } catch (err) {
+          for (const evt of batch) {
+            if (sent.includes(evt.id)) {
+              await this.reschedule(evt, err);
+            }
+          }
+        }
+      }
     } catch (err) {
-      this.scheduleOrDrop(entry, now, err instanceof Error ? err.message : 'unknown error');
+      this.logger.error(`Outbox drain failed: ${(err as Error).message}`);
+    } finally {
+      this.draining = false;
     }
   }
 
-  private scheduleOrDrop(entry: OutboxEntry, now: number, reason: string): void {
-    const backoff = RETRY_BACKOFF_MS[entry.attempts - 1];
+  private async reschedule(evt: OutboxEvent, err: unknown): Promise<void> {
+    const attempts = evt.attempts + 1;
+    const backoff = RETRY_BACKOFF_MS[attempts - 1];
+    const reason = err instanceof Error ? err.message : 'unknown error';
+
     if (backoff === undefined) {
-      this.pending.delete(entry.id);
+      await this.prisma.outboxEvent.update({
+        where: { id: evt.id },
+        data: { attempts, failedAt: new Date(), lastError: reason },
+      });
       this.logger.error(
-        `Giving up on "${entry.subject}" after ${entry.attempts} attempt(s): ${reason}`,
+        `Giving up on "${evt.subject}" (${evt.id}) after ${attempts} attempt(s): ${reason}`,
       );
       return;
     }
-    entry.nextAttemptAt = now + backoff;
+
+    await this.prisma.outboxEvent.update({
+      where: { id: evt.id },
+      data: { attempts, nextAttemptAt: new Date(Date.now() + backoff), lastError: reason },
+    });
     this.logger.warn(
-      `Publish of "${entry.subject}" failed (${reason}); ` +
-        `retry ${entry.attempts}/${MAX_ATTEMPTS - 1} scheduled in ${backoff}ms`,
+      `Publish of "${evt.subject}" failed (${reason}); ` +
+        `retry ${attempts}/${RETRY_BACKOFF_MS.length} in ${backoff}ms`,
     );
   }
 }

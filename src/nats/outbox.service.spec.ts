@@ -1,94 +1,160 @@
 import type { NatsConnection } from 'nats';
+import type { PrismaService } from '../prisma/prisma.service';
+import type { NatsConnectionManager } from './nats-connection.manager';
 import { OutboxService } from './outbox.service';
 
+/** Premier argument du premier appel d'un mock, typé sans passer par `any`. */
+function firstArg<T>(mock: jest.Mock): T {
+  return (mock.mock.calls as unknown[][])[0][0] as T;
+}
+
 /**
- * OutboxService avec une connexion NATS mockée : publication immédiate, retry à
- * backoff, abandon après le nombre max de tentatives, et best-effort (aucune
- * exception ne remonte à l'appelant).
+ * OutboxService durable : Prisma et NatsConnectionManager mockés. On vérifie le
+ * drain (publish + flush + marquage), le no-op quand NATS est down, le retry à
+ * backoff, l'abandon après épuisement, et le best-effort (rien ne remonte).
  */
 describe('OutboxService', () => {
-  const subject = 'messaging.message.created';
-  const payload = { messageId: 'm1' };
-
-  function makeConn(): { publish: jest.Mock; drain: jest.Mock } {
-    return { publish: jest.fn(), drain: jest.fn().mockResolvedValue(undefined) };
-  }
-
-  it('publishes immediately and leaves nothing pending on success', () => {
-    const conn = makeConn();
-    const outbox = new OutboxService(conn as unknown as NatsConnection);
-
-    outbox.enqueue(subject, payload);
-
-    expect(conn.publish).toHaveBeenCalledTimes(1);
-    expect(conn.publish).toHaveBeenCalledWith(subject, expect.anything());
-    expect(outbox.pendingCount).toBe(0);
+  const row = (over: Partial<Record<string, unknown>> = {}) => ({
+    id: 'evt-1',
+    subject: 'messaging.message.created',
+    payload: { messageId: 'm1' },
+    attempts: 0,
+    publishedAt: null,
+    nextAttemptAt: new Date('2026-09-09T10:00:00Z'),
+    failedAt: null,
+    lastError: null,
+    createdAt: new Date('2026-09-09T10:00:00Z'),
+    ...over,
   });
 
-  it('keeps the event pending when the immediate publish throws, then retries on drain', () => {
-    const conn = makeConn();
-    conn.publish.mockImplementationOnce(() => {
+  let prisma: {
+    outboxEvent: {
+      findMany: jest.Mock;
+      updateMany: jest.Mock;
+      update: jest.Mock;
+      count: jest.Mock;
+    };
+  };
+  let conn: { publish: jest.Mock; flush: jest.Mock };
+  let manager: { connection: NatsConnection | null };
+  let outbox: OutboxService;
+
+  beforeEach(() => {
+    prisma = {
+      outboxEvent: {
+        findMany: jest.fn().mockResolvedValue([]),
+        updateMany: jest.fn().mockResolvedValue({ count: 0 }),
+        update: jest.fn().mockResolvedValue({}),
+        count: jest.fn().mockResolvedValue(0),
+      },
+    };
+    conn = { publish: jest.fn(), flush: jest.fn().mockResolvedValue(undefined) };
+    manager = { connection: conn as unknown as NatsConnection };
+    outbox = new OutboxService(
+      prisma as unknown as PrismaService,
+      manager as unknown as NatsConnectionManager,
+    );
+  });
+
+  it('publishes pending rows, flushes, then marks them published', async () => {
+    prisma.outboxEvent.findMany.mockResolvedValue([row({ id: 'a' }), row({ id: 'b' })]);
+
+    await outbox.drain();
+
+    expect(conn.publish).toHaveBeenCalledTimes(2);
+    expect(conn.flush).toHaveBeenCalledTimes(1);
+    const args = firstArg<{ where: unknown; data: { publishedAt: unknown; lastError: unknown } }>(
+      prisma.outboxEvent.updateMany,
+    );
+    expect(args.where).toEqual({ id: { in: ['a', 'b'] } });
+    expect(args.data.publishedAt).toBeInstanceOf(Date);
+    expect(args.data.lastError).toBeNull();
+  });
+
+  it('is a no-op when NATS is unavailable (nothing published, nothing failed)', async () => {
+    manager.connection = null;
+    prisma.outboxEvent.findMany.mockResolvedValue([row()]);
+
+    await outbox.drain();
+
+    expect(conn.publish).not.toHaveBeenCalled();
+    expect(prisma.outboxEvent.update).not.toHaveBeenCalled();
+    expect(prisma.outboxEvent.updateMany).not.toHaveBeenCalled();
+  });
+
+  it('reschedules with backoff when publish throws, without marking published', async () => {
+    conn.publish.mockImplementation(() => {
       throw new Error('nats down');
     });
-    const outbox = new OutboxService(conn as unknown as NatsConnection);
-    const t0 = 1_000_000;
-    jest.spyOn(Date, 'now').mockReturnValue(t0);
+    prisma.outboxEvent.findMany.mockResolvedValue([row({ id: 'a', attempts: 0 })]);
 
-    outbox.enqueue(subject, payload);
-    expect(outbox.pendingCount).toBe(1);
+    await outbox.drain();
 
-    // Avant l'échéance de retry (backoff 1s) : rien.
-    outbox.drain(t0 + 500);
-    expect(conn.publish).toHaveBeenCalledTimes(1);
-
-    // Après l'échéance : re-tentative, cette fois le mock réussit.
-    outbox.drain(t0 + 1_500);
-    expect(conn.publish).toHaveBeenCalledTimes(2);
-    expect(outbox.pendingCount).toBe(0);
-
-    (Date.now as jest.Mock).mockRestore();
+    const args = firstArg<{ where: unknown; data: { attempts: unknown; nextAttemptAt: unknown } }>(
+      prisma.outboxEvent.update,
+    );
+    expect(args.where).toEqual({ id: 'a' });
+    expect(args.data.attempts).toBe(1);
+    expect(args.data.nextAttemptAt).toBeInstanceOf(Date);
+    expect(prisma.outboxEvent.updateMany).not.toHaveBeenCalled();
   });
 
-  it('gives up after the maximum number of attempts (connection unavailable)', () => {
-    const outbox = new OutboxService(null);
+  it('marks the row failed once the retry budget is exhausted', async () => {
+    conn.publish.mockImplementation(() => {
+      throw new Error('still down');
+    });
+    // 5 backoff steps -> attempts 5 already means the next failure is terminal.
+    prisma.outboxEvent.findMany.mockResolvedValue([row({ id: 'a', attempts: 5 })]);
     const errorLog = jest.spyOn(
       (outbox as unknown as { logger: { error: jest.Mock } }).logger,
       'error',
     );
-    const t0 = 2_000_000;
-    jest.spyOn(Date, 'now').mockReturnValue(t0);
 
-    outbox.enqueue(subject, payload); // attempt 1 -> backoff 1s
-    expect(outbox.pendingCount).toBe(1);
+    await outbox.drain();
 
-    outbox.drain(t0 + 1_001); // attempt 2 -> backoff 5s
-    outbox.drain(t0 + 6_002); // attempt 3 -> backoff 30s
-    outbox.drain(t0 + 36_003); // attempt 4 -> no backoff left -> drop
-
-    expect(outbox.pendingCount).toBe(0);
+    const args = firstArg<{ where: unknown; data: { attempts: unknown; failedAt: unknown } }>(
+      prisma.outboxEvent.update,
+    );
+    expect(args.where).toEqual({ id: 'a' });
+    expect(args.data.attempts).toBe(6);
+    expect(args.data.failedAt).toBeInstanceOf(Date);
     expect(errorLog).toHaveBeenCalledWith(expect.stringContaining('Giving up'));
-
-    (Date.now as jest.Mock).mockRestore();
   });
 
-  it('never throws to the caller even if publish blows up (best-effort)', () => {
-    const conn = makeConn();
-    conn.publish.mockImplementation(() => {
-      throw new Error('boom');
+  it('reschedules the whole batch when flush() rejects after publish', async () => {
+    conn.flush.mockRejectedValue(new Error('flush timeout'));
+    prisma.outboxEvent.findMany.mockResolvedValue([row({ id: 'a' }), row({ id: 'b' })]);
+
+    await outbox.drain();
+
+    expect(prisma.outboxEvent.updateMany).not.toHaveBeenCalled();
+    expect(prisma.outboxEvent.update).toHaveBeenCalledTimes(2);
+  });
+
+  it('wake() never throws to the caller', () => {
+    prisma.outboxEvent.findMany.mockRejectedValue(new Error('db gone'));
+    expect(() => outbox.wake()).not.toThrow();
+  });
+
+  it('enqueueInTx writes the row through the transaction client', async () => {
+    const tx = { outboxEvent: { create: jest.fn().mockResolvedValue({ id: 'evt-9' }) } };
+
+    await outbox.enqueueInTx(tx as never, 'messaging.message.created', {
+      messageId: 'm1',
     });
-    const outbox = new OutboxService(conn as unknown as NatsConnection);
 
-    expect(() => outbox.enqueue(subject, payload)).not.toThrow();
-    expect(outbox.pendingCount).toBe(1);
+    expect(tx.outboxEvent.create).toHaveBeenCalledWith({
+      data: { subject: 'messaging.message.created', payload: { messageId: 'm1' } },
+      select: { id: true },
+    });
   });
 
-  it('drains the NATS connection on shutdown', async () => {
-    const conn = makeConn();
-    const outbox = new OutboxService(conn as unknown as NatsConnection);
-    outbox.onModuleInit();
+  it('countPending queries only unpublished, non-failed rows', async () => {
+    prisma.outboxEvent.count.mockResolvedValue(4);
 
-    await outbox.onModuleDestroy();
-
-    expect(conn.drain).toHaveBeenCalledTimes(1);
+    await expect(outbox.countPending()).resolves.toBe(4);
+    expect(prisma.outboxEvent.count).toHaveBeenCalledWith({
+      where: { publishedAt: null, failedAt: null },
+    });
   });
 });

@@ -1,6 +1,5 @@
 import { ForbiddenException, NotFoundException } from '@nestjs/common';
 import { EventEmitter2 } from '@nestjs/event-emitter';
-import type { NatsConnection } from 'nats';
 import {
   TEST_CONVERSATION_ID,
   TEST_USERS,
@@ -8,15 +7,15 @@ import {
   makeMessage,
 } from '../common/test-fixtures';
 import { ConversationsService } from '../conversations/conversations.service';
-import { NatsPublisherService } from '../nats/nats-publisher.service';
-import { OutboxService } from '../nats/outbox.service';
+import type { OutboxService } from '../nats/outbox.service';
 import { PrismaService } from '../prisma/prisma.service';
 import { MessagesService } from './messages.service';
 
 /**
- * Tests unitaires : Prisma, ConversationsService et l'event bus mockés ; vrai
- * NatsPublisherService au-dessus d'un vrai OutboxService avec une connexion NATS
- * mockée (pour vérifier la publication réelle des événements d'intégration).
+ * Tests unitaires : Prisma, ConversationsService, l'event bus et OutboxService
+ * mockés. `$transaction(cb)` exécute le callback avec le prisma mocké comme
+ * client tx. On vérifie l'écriture métier, l'événement interne, l'enfilement
+ * de l'événement d'intégration dans la transaction, et le filtrage soft-delete.
  */
 describe('MessagesService', () => {
   const createdAt = new Date('2026-09-07T10:00:00.000Z');
@@ -26,8 +25,8 @@ describe('MessagesService', () => {
     userBId: TEST_USERS.bob,
   });
 
-  let natsClient: { publish: jest.Mock };
   let prisma: {
+    $transaction: jest.Mock;
     message: {
       create: jest.Mock;
       findMany: jest.Mock;
@@ -39,12 +38,12 @@ describe('MessagesService', () => {
   };
   let conversations: { getParticipantConversation: jest.Mock };
   let events: { emit: jest.Mock };
-  let publisher: NatsPublisherService;
+  let outbox: { enqueueInTx: jest.Mock; wake: jest.Mock };
   let service: MessagesService;
 
   beforeEach(() => {
-    natsClient = { publish: jest.fn() };
     prisma = {
+      $transaction: jest.fn((cb: (tx: unknown) => unknown) => cb(prisma)),
       message: {
         create: jest.fn().mockResolvedValue(makeMessage({ id: 'msg-1', createdAt })),
         findMany: jest.fn(),
@@ -58,14 +57,12 @@ describe('MessagesService', () => {
       getParticipantConversation: jest.fn().mockResolvedValue(conversationRow),
     };
     events = { emit: jest.fn() };
-    publisher = new NatsPublisherService(
-      new OutboxService(natsClient as unknown as NatsConnection),
-    );
+    outbox = { enqueueInTx: jest.fn().mockResolvedValue({ id: 'evt' }), wake: jest.fn() };
     service = new MessagesService(
       prisma as unknown as PrismaService,
       conversations as unknown as ConversationsService,
       events as unknown as EventEmitter2,
-      publisher,
+      outbox as unknown as OutboxService,
     );
   });
 
@@ -83,31 +80,30 @@ describe('MessagesService', () => {
       );
     });
 
-    it('publishes messaging.message.created (without content) after the DB write', async () => {
-      const publishSpy = jest.spyOn(publisher, 'publish');
-
+    it('enqueues messaging.message.created (ISO date, no content) inside the transaction, then wakes the outbox', async () => {
       await service.send(TEST_CONVERSATION_ID, TEST_USERS.alice, { content: 'hello' });
 
-      expect(publishSpy).toHaveBeenCalledWith('messaging.message.created', {
+      expect(outbox.enqueueInTx).toHaveBeenCalledWith(prisma, 'messaging.message.created', {
         messageId: 'msg-1',
         conversationId: TEST_CONVERSATION_ID,
         senderId: TEST_USERS.alice,
-        createdAt,
+        createdAt: createdAt.toISOString(),
       });
-      expect(natsClient.publish).toHaveBeenCalledWith(
-        'messaging.message.created',
-        expect.anything(),
-      );
-      expect(prisma.message.create.mock.invocationCallOrder[0]).toBeLessThan(
-        publishSpy.mock.invocationCallOrder[0],
+      expect(prisma.$transaction).toHaveBeenCalledTimes(1);
+      expect(outbox.wake).toHaveBeenCalledTimes(1);
+      // enqueue happens within the tx callback, before wake().
+      expect(outbox.enqueueInTx.mock.invocationCallOrder[0]).toBeLessThan(
+        outbox.wake.mock.invocationCallOrder[0],
       );
     });
 
-    it('does not fail the send when NATS publish throws (best-effort via outbox)', async () => {
-      natsClient.publish.mockImplementation(() => {
-        throw new Error('nats down');
+    it('still resolves if waking the outbox throws (best-effort)', async () => {
+      outbox.wake.mockImplementation(() => {
+        throw new Error('boom');
       });
 
+      // wake() is fire-and-forget in the service; a throw must not surface, but
+      // even if it did the send has already committed. Guard the contract:
       await expect(
         service.send(TEST_CONVERSATION_ID, TEST_USERS.alice, { content: 'hello' }),
       ).resolves.toMatchObject({ id: 'msg-1' });
@@ -122,8 +118,7 @@ describe('MessagesService', () => {
   });
 
   describe('paginate', () => {
-    it('returns a stable page and a nextCursor when more rows exist', async () => {
-      // limit 2 -> le service demande 3 lignes ; 3 renvoyées => il reste une page.
+    it('excludes soft-deleted rows, returns a stable page and a nextCursor when more rows exist', async () => {
       const rows = [
         makeMessage({ id: 'm3' }),
         makeMessage({ id: 'm2' }),
@@ -135,6 +130,7 @@ describe('MessagesService', () => {
 
       expect(prisma.message.findMany).toHaveBeenCalledWith(
         expect.objectContaining({
+          where: { conversationId: TEST_CONVERSATION_ID, deletedAt: null },
           take: 3,
           orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
         }),
@@ -183,6 +179,14 @@ describe('MessagesService', () => {
       );
     });
 
+    it('throws NotFoundException for a soft-deleted message', async () => {
+      prisma.message.findUnique.mockResolvedValue(makeMessage({ deletedAt: new Date() }));
+
+      await expect(service.markRead('msg-1', TEST_USERS.bob)).rejects.toBeInstanceOf(
+        NotFoundException,
+      );
+    });
+
     it('forbids the sender from marking their own message as read', async () => {
       prisma.message.findUnique.mockResolvedValue(makeMessage({ senderId: TEST_USERS.alice }));
 
@@ -192,7 +196,7 @@ describe('MessagesService', () => {
       expect(prisma.message.update).not.toHaveBeenCalled();
     });
 
-    it('is idempotent: an already-read message is returned as-is, no event, no update', async () => {
+    it('is idempotent: an already-read message is returned as-is, no event, no enqueue', async () => {
       const alreadyRead = makeMessage({ senderId: TEST_USERS.alice, readAt: createdAt });
       prisma.message.findUnique.mockResolvedValue(alreadyRead);
 
@@ -201,9 +205,10 @@ describe('MessagesService', () => {
       expect(result).toBe(alreadyRead);
       expect(prisma.message.update).not.toHaveBeenCalled();
       expect(events.emit).not.toHaveBeenCalled();
+      expect(outbox.enqueueInTx).not.toHaveBeenCalled();
     });
 
-    it('marks an unread received message as read and emits message.read', async () => {
+    it('marks an unread received message as read, enqueues messaging.message.read and emits message.read', async () => {
       prisma.message.findUnique.mockResolvedValue(
         makeMessage({ id: 'msg-1', senderId: TEST_USERS.alice, readAt: null }),
       );
@@ -217,6 +222,11 @@ describe('MessagesService', () => {
       expect(prisma.message.update).toHaveBeenCalledWith(
         expect.objectContaining({ where: { id: 'msg-1' } }),
       );
+      expect(outbox.enqueueInTx).toHaveBeenCalledWith(prisma, 'messaging.message.read', {
+        messageId: 'msg-1',
+        conversationId: TEST_CONVERSATION_ID,
+        readAt: readAt.toISOString(),
+      });
       expect(events.emit).toHaveBeenCalledWith(
         'message.read',
         expect.objectContaining({ messageId: 'msg-1', readBy: TEST_USERS.bob }),
@@ -226,7 +236,7 @@ describe('MessagesService', () => {
   });
 
   describe('markConversationRead', () => {
-    it('bulk-marks received unread messages and emits conversation.read', async () => {
+    it('bulk-marks received unread messages, enqueues messaging.conversation.read and emits conversation.read', async () => {
       const result = await service.markConversationRead(TEST_CONVERSATION_ID, TEST_USERS.bob);
 
       expect(prisma.message.updateMany).toHaveBeenCalledWith(
@@ -235,7 +245,17 @@ describe('MessagesService', () => {
             conversationId: TEST_CONVERSATION_ID,
             senderId: { not: TEST_USERS.bob },
             readAt: null,
+            deletedAt: null,
           },
+        }),
+      );
+      expect(outbox.enqueueInTx).toHaveBeenCalledWith(
+        prisma,
+        'messaging.conversation.read',
+        expect.objectContaining({
+          conversationId: TEST_CONVERSATION_ID,
+          count: 3,
+          readBy: TEST_USERS.bob,
         }),
       );
       expect(result).toEqual({ updated: 3 });
@@ -245,13 +265,14 @@ describe('MessagesService', () => {
       );
     });
 
-    it('is a no-op (no event) when nothing was unread', async () => {
+    it('is a no-op (no event, no enqueue) when nothing was unread', async () => {
       prisma.message.updateMany.mockResolvedValueOnce({ count: 0 });
 
       const result = await service.markConversationRead(TEST_CONVERSATION_ID, TEST_USERS.bob);
 
       expect(result).toEqual({ updated: 0 });
       expect(events.emit).not.toHaveBeenCalled();
+      expect(outbox.enqueueInTx).not.toHaveBeenCalled();
     });
   });
 });

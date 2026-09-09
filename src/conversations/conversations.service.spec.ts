@@ -1,47 +1,48 @@
 import { ForbiddenException, NotFoundException } from '@nestjs/common';
-import {
-  FIXED_NOW,
-  TEST_CONVERSATION_ID,
-  TEST_USERS,
-  makeConversation,
-} from '../common/test-fixtures';
+import { TEST_CONVERSATION_ID, TEST_USERS, makeConversation } from '../common/test-fixtures';
 import { Prisma } from '../generated/prisma/client';
-import { NatsPublisherService } from '../nats/nats-publisher.service';
+import type { OutboxService } from '../nats/outbox.service';
 import { PrismaService } from '../prisma/prisma.service';
 import { ConversationsService } from './conversations.service';
 
 /**
- * Tests unitaires du service : Prisma et NatsPublisherService entièrement mockés.
- * On vérifie la normalisation de paire, la gestion de la race condition P2002,
- * le décompte des non-lus et le contrôle d'accès participant.
+ * Tests unitaires du service : Prisma et OutboxService entièrement mockés.
+ * `$transaction(cb)` exécute le callback avec le prisma mocké comme client tx.
+ * On vérifie la normalisation de paire, la race condition P2002, la
+ * réactivation d'une conversation soft-deletée, le décompte des non-lus et le
+ * contrôle d'accès participant.
  */
 describe('ConversationsService', () => {
   let prisma: {
+    $transaction: jest.Mock;
     conversation: {
       findMany: jest.Mock;
       findUnique: jest.Mock;
       findUniqueOrThrow: jest.Mock;
+      update: jest.Mock;
       create: jest.Mock;
     };
     message: { groupBy: jest.Mock };
   };
-  let nats: { publish: jest.Mock };
+  let outbox: { enqueueInTx: jest.Mock; wake: jest.Mock };
   let service: ConversationsService;
 
   beforeEach(() => {
     prisma = {
+      $transaction: jest.fn((cb: (tx: unknown) => unknown) => cb(prisma)),
       conversation: {
         findMany: jest.fn(),
         findUnique: jest.fn(),
         findUniqueOrThrow: jest.fn(),
+        update: jest.fn(),
         create: jest.fn(),
       },
       message: { groupBy: jest.fn() },
     };
-    nats = { publish: jest.fn().mockResolvedValue(undefined) };
+    outbox = { enqueueInTx: jest.fn().mockResolvedValue({ id: 'evt' }), wake: jest.fn() };
     service = new ConversationsService(
       prisma as unknown as PrismaService,
-      nats as unknown as NatsPublisherService,
+      outbox as unknown as OutboxService,
     );
   });
 
@@ -53,7 +54,7 @@ describe('ConversationsService', () => {
       expect(prisma.conversation.findUnique).not.toHaveBeenCalled();
     });
 
-    it('creates a new conversation, normalising the pair and publishing the NATS event', async () => {
+    it('creates a new conversation, normalising the pair and enqueuing the outbox event in the tx', async () => {
       prisma.conversation.findUnique.mockResolvedValue(null);
       const created = makeConversation();
       prisma.conversation.create.mockResolvedValue(created);
@@ -64,19 +65,21 @@ describe('ConversationsService', () => {
       expect(prisma.conversation.create).toHaveBeenCalledWith({
         data: { userAId: TEST_USERS.alice, userBId: TEST_USERS.bob },
       });
-      expect(nats.publish).toHaveBeenCalledWith(
+      expect(outbox.enqueueInTx).toHaveBeenCalledWith(
+        prisma,
         'messaging.conversation.created',
         expect.objectContaining({
           conversationId: created.id,
           userAId: TEST_USERS.alice,
           userBId: TEST_USERS.bob,
-          createdAt: FIXED_NOW,
+          createdAt: created.createdAt.toISOString(),
         }),
       );
+      expect(outbox.wake).toHaveBeenCalledTimes(1);
       expect(result).toBe(created);
     });
 
-    it('returns the existing conversation without creating or publishing', async () => {
+    it('returns an existing active conversation without creating or enqueuing', async () => {
       const existing = makeConversation();
       prisma.conversation.findUnique.mockResolvedValue(existing);
 
@@ -84,7 +87,24 @@ describe('ConversationsService', () => {
 
       expect(result).toBe(existing);
       expect(prisma.conversation.create).not.toHaveBeenCalled();
-      expect(nats.publish).not.toHaveBeenCalled();
+      expect(outbox.enqueueInTx).not.toHaveBeenCalled();
+    });
+
+    it('reactivates a soft-deleted conversation instead of creating a new one', async () => {
+      const deleted = makeConversation({ deletedAt: new Date('2026-09-01T00:00:00Z') });
+      prisma.conversation.findUnique.mockResolvedValue(deleted);
+      const revived = makeConversation({ deletedAt: null });
+      prisma.conversation.update.mockResolvedValue(revived);
+
+      const result = await service.findOrCreate(TEST_USERS.alice, TEST_USERS.bob);
+
+      expect(prisma.conversation.update).toHaveBeenCalledWith({
+        where: { id: deleted.id },
+        data: { deletedAt: null },
+      });
+      expect(prisma.conversation.create).not.toHaveBeenCalled();
+      expect(outbox.enqueueInTx).not.toHaveBeenCalled();
+      expect(result).toBe(revived);
     });
 
     it('handles the P2002 race condition by returning the concurrently-created row', async () => {
@@ -101,8 +121,7 @@ describe('ConversationsService', () => {
       const result = await service.findOrCreate(TEST_USERS.alice, TEST_USERS.bob);
 
       expect(result).toBe(concurrent);
-      // Pas d'événement d'intégration : ce n'est pas nous qui avons créé la ligne.
-      expect(nats.publish).not.toHaveBeenCalled();
+      expect(outbox.wake).not.toHaveBeenCalled();
     });
 
     it('rethrows a non-P2002 Prisma error', async () => {
@@ -125,7 +144,7 @@ describe('ConversationsService', () => {
       expect(prisma.message.groupBy).not.toHaveBeenCalled();
     });
 
-    it('attaches unreadCount per conversation, defaulting to 0', async () => {
+    it('filters out soft-deleted conversations and attaches unreadCount, defaulting to 0', async () => {
       const c1 = makeConversation({ id: 'conv-1' });
       const c2 = makeConversation({
         id: 'conv-2',
@@ -137,6 +156,14 @@ describe('ConversationsService', () => {
 
       const result = await service.listForUser(TEST_USERS.alice);
 
+      expect(prisma.conversation.findMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: {
+            OR: [{ userAId: TEST_USERS.alice }, { userBId: TEST_USERS.alice }],
+            deletedAt: null,
+          },
+        }),
+      );
       expect(result).toEqual([
         { ...c1, unreadCount: 4 },
         { ...c2, unreadCount: 0 },
@@ -148,6 +175,7 @@ describe('ConversationsService', () => {
             conversationId: { in: ['conv-1', 'conv-2'] },
             senderId: { not: TEST_USERS.alice },
             readAt: null,
+            deletedAt: null,
           },
         }),
       );
@@ -160,6 +188,14 @@ describe('ConversationsService', () => {
 
       await expect(
         service.getParticipantConversation(TEST_CONVERSATION_ID, TEST_USERS.alice),
+      ).rejects.toBeInstanceOf(NotFoundException);
+    });
+
+    it('throws NotFoundException when the conversation is soft-deleted', async () => {
+      prisma.conversation.findUnique.mockResolvedValue(makeConversation({ deletedAt: new Date() }));
+
+      await expect(
+        service.getParticipantConversation(TEST_CONVERSATION_ID, TEST_USERS.bob),
       ).rejects.toBeInstanceOf(NotFoundException);
     });
 

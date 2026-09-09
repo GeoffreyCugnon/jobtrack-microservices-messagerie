@@ -1,12 +1,12 @@
-import { ForbiddenException, Injectable, NotFoundException } from '@nestjs/common';
+import { ForbiddenException, Injectable, Logger, NotFoundException } from '@nestjs/common';
 import { assertUuid } from '../common/assert';
 import { Conversation, Prisma } from '../generated/prisma/client';
+import { OutboxService } from '../nats/outbox.service';
+import { NATS_SUBJECTS } from '../nats/nats.events';
+import { PrismaService } from '../prisma/prisma.service';
 
 /** Conversation enrichie du nombre de messages non lus pour l'appelant. */
 export type ConversationWithUnread = Conversation & { unreadCount: number };
-import { NatsPublisherService } from '../nats/nats-publisher.service';
-import { NATS_SUBJECTS } from '../nats/nats.events';
-import { PrismaService } from '../prisma/prisma.service';
 
 /**
  * Création et récupération des conversations one-to-one.
@@ -16,10 +16,21 @@ import { PrismaService } from '../prisma/prisma.service';
  */
 @Injectable()
 export class ConversationsService {
+  private readonly logger = new Logger(ConversationsService.name);
+
   constructor(
     private readonly prisma: PrismaService,
-    private readonly nats: NatsPublisherService,
+    private readonly outbox: OutboxService,
   ) {}
+
+  /** Réveil de l'outbox, blindé : la conversation est déjà committée. */
+  private safeWake(): void {
+    try {
+      this.outbox.wake();
+    } catch (err) {
+      this.logger.error(`Failed to wake outbox: ${(err as Error).message}`);
+    }
+  }
 
   /**
    * Ordonne la paire pour qu'une conversation entre X et Y mappe toujours la même
@@ -31,14 +42,14 @@ export class ConversationsService {
   }
 
   /**
-   * Conversations de l'utilisateur, les plus récemment actives d'abord (null en
-   * dernier), chacune avec `unreadCount` = nombre de messages reçus (donc pas
-   * envoyés par lui) encore non lus. Le décompte se fait en une seule requête
-   * `groupBy` (index partiel `WHERE "readAt" IS NULL` en base).
+   * Conversations non supprimées de l'utilisateur, les plus récemment actives
+   * d'abord (null en dernier), chacune avec `unreadCount` = nombre de messages
+   * reçus (donc pas envoyés par lui) encore non lus. Le décompte se fait en une
+   * seule requête `groupBy` (index partiel `WHERE "readAt" IS NULL` en base).
    */
   async listForUser(userId: string): Promise<ConversationWithUnread[]> {
     const conversations = await this.prisma.conversation.findMany({
-      where: { OR: [{ userAId: userId }, { userBId: userId }] },
+      where: { OR: [{ userAId: userId }, { userBId: userId }], deletedAt: null },
       orderBy: [{ lastMessageAt: { sort: 'desc', nulls: 'last' } }, { createdAt: 'desc' }],
     });
     if (conversations.length === 0) {
@@ -51,6 +62,7 @@ export class ConversationsService {
         conversationId: { in: conversations.map((c) => c.id) },
         senderId: { not: userId },
         readAt: null,
+        deletedAt: null,
       },
       _count: { _all: true },
     });
@@ -66,8 +78,9 @@ export class ConversationsService {
 
   /**
    * Retourne la conversation entre les deux utilisateurs, en la créant si besoin.
+   * Une conversation soft-deletée est réactivée (`deletedAt` remis à null).
    * L'événement NATS `messaging.conversation.created` n'est publié qu'en cas de
-   * création réelle (pas quand une conversation existante est renvoyée).
+   * création réelle (pas sur récupération / réactivation).
    */
   async findOrCreate(userId: string, otherUserId: string): Promise<Conversation> {
     // Défense en profondeur : `participantId` est déjà `@IsUUID` au niveau DTO.
@@ -81,12 +94,28 @@ export class ConversationsService {
       where: { userAId_userBId: { userAId, userBId } },
     });
     if (existing) {
+      if (existing.deletedAt) {
+        return this.prisma.conversation.update({
+          where: { id: existing.id },
+          data: { deletedAt: null },
+        });
+      }
       return existing;
     }
 
     let created: Conversation;
     try {
-      created = await this.prisma.conversation.create({ data: { userAId, userBId } });
+      created = await this.prisma.$transaction(async (tx) => {
+        const row = await tx.conversation.create({ data: { userAId, userBId } });
+        // Événement d'intégration écrit dans la même transaction (outbox durable).
+        await this.outbox.enqueueInTx(tx, NATS_SUBJECTS.conversationCreated, {
+          conversationId: row.id,
+          userAId: row.userAId,
+          userBId: row.userBId,
+          createdAt: row.createdAt.toISOString(),
+        });
+        return row;
+      });
     } catch (err) {
       // Course perdue face à une création concurrente (P2002 = violation d'unicité) :
       // on renvoie la ligne existante, sans publier d'événement.
@@ -98,25 +127,19 @@ export class ConversationsService {
       throw err;
     }
 
-    // Événement d'intégration best-effort, après l'écriture réussie.
-    await this.nats.publish(NATS_SUBJECTS.conversationCreated, {
-      conversationId: created.id,
-      userAId: created.userAId,
-      userBId: created.userBId,
-      createdAt: created.createdAt,
-    });
-
+    this.safeWake();
     return created;
   }
 
   /**
-   * Charge une conversation et vérifie que `userId` en est bien participant.
-   * @throws NotFoundException  conversation inconnue
+   * Charge une conversation non supprimée et vérifie que `userId` en est bien
+   * participant.
+   * @throws NotFoundException  conversation inconnue ou supprimée
    * @throws ForbiddenException  utilisateur non participant
    */
   async getParticipantConversation(id: string, userId: string): Promise<Conversation> {
     const conversation = await this.prisma.conversation.findUnique({ where: { id } });
-    if (!conversation) {
+    if (!conversation || conversation.deletedAt) {
       throw new NotFoundException('Conversation not found');
     }
     if (conversation.userAId !== userId && conversation.userBId !== userId) {

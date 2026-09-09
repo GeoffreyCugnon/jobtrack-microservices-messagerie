@@ -1,18 +1,17 @@
-import { Controller, Get, Inject, ServiceUnavailableException } from '@nestjs/common';
-import type { NatsConnection } from 'nats';
+import { Controller, Get, ServiceUnavailableException } from '@nestjs/common';
 import { Public } from '../auth/public.decorator';
 import { SkipRateLimit } from '../common/skip-rate-limit.decorator';
-import { NATS_CONNECTION } from '../nats/nats.constants';
+import { NatsConnectionManager } from '../nats/nats-connection.manager';
 import { OutboxService } from '../nats/outbox.service';
 import { PrismaService } from '../prisma/prisma.service';
 
-type DepStatus = 'ok' | 'down' | 'disabled';
+type DepStatus = 'ok' | 'down';
 
 interface HealthReport {
   status: 'ok' | 'degraded';
   database: DepStatus;
   nats: DepStatus;
-  /** Événements d'intégration en attente de publication NATS (outbox). */
+  /** Événements d'intégration en attente de publication NATS (outbox durable). */
   outboxPending: number;
 }
 
@@ -34,29 +33,26 @@ function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
  * être exploitable comme *readiness probe* : un simple 200 « dégradé » laissait
  * l'orchestrateur router du trafic vers une instance incapable de servir.
  * NATS injoignable ne fait **pas** échouer la sonde (publication best-effort,
- * rejouée par l'outbox) : c'est reporté dans le corps sans changer le code HTTP.
+ * rejouée par l'outbox durable) : reporté dans le corps sans changer le code HTTP.
  */
 @Controller('health')
 export class HealthController {
   constructor(
     private readonly prisma: PrismaService,
     private readonly outbox: OutboxService,
-    @Inject(NATS_CONNECTION) private readonly nats: NatsConnection | null,
+    private readonly nats: NatsConnectionManager,
   ) {}
 
   @Public()
   @SkipRateLimit()
   @Get()
   async check(): Promise<HealthReport> {
-    const [database, nats] = await Promise.all([
-      this.checkDatabase(),
-      Promise.resolve(this.checkNats()),
-    ]);
+    const [database, outboxPending] = await Promise.all([this.checkDatabase(), this.checkOutbox()]);
     const report: HealthReport = {
       status: database === 'ok' ? 'ok' : 'degraded',
       database,
-      nats,
-      outboxPending: this.outbox.pendingCount,
+      nats: this.nats.status,
+      outboxPending,
     };
     if (report.status !== 'ok') {
       throw new ServiceUnavailableException(report);
@@ -73,10 +69,11 @@ export class HealthController {
     }
   }
 
-  private checkNats(): DepStatus {
-    if (!this.nats) {
-      return 'disabled';
+  private async checkOutbox(): Promise<number> {
+    try {
+      return await withTimeout(this.outbox.countPending(), 1000);
+    } catch {
+      return -1; // sonde indisponible (base lente) : -1 plutôt que de faire échouer /health
     }
-    return this.nats.isClosed() ? 'down' : 'ok';
   }
 }
