@@ -1,4 +1,14 @@
-import { Body, Controller, Delete, Get, Param, ParseUUIDPipe, Post, Query } from '@nestjs/common';
+import {
+  Body,
+  Controller,
+  Delete,
+  Get,
+  HttpCode,
+  Param,
+  ParseUUIDPipe,
+  Post,
+  Query,
+} from '@nestjs/common';
 import { AuthUser } from '../auth/auth-user.interface';
 import { CurrentUser } from '../auth/current-user.decorator';
 import { ConversationsService } from './conversations.service';
@@ -41,6 +51,7 @@ export class ConversationsController {
 
   /** POST /conversations/:id/restore — restaure une conversation soft-deletée. */
   @Post(':id/restore')
+  @HttpCode(200)
   restore(@CurrentUser() user: AuthUser, @Param('id', ParseUUIDPipe) id: string) {
     return this.conversations.restore(id, user.id);
   }

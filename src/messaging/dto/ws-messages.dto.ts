@@ -1,3 +1,4 @@
+import { Transform } from 'class-transformer';
 import {
   IsObject,
   IsOptional,
@@ -8,6 +9,10 @@ import {
   MinLength,
 } from 'class-validator';
 import { MaxJsonSize } from '../../common/max-json-size.validator';
+
+/** Retire les espaces de bord d'une chaîne (no-op sur les autres types). */
+const trim = ({ value }: { value: unknown }): unknown =>
+  typeof value === 'string' ? value.trim() : value;
 
 /**
  * DTO des messages entrants Socket.IO. Validés par le ValidationPipe posé sur la
@@ -26,6 +31,7 @@ export class WsSendMessageDto {
   @IsUUID()
   conversationId!: string;
 
+  @Transform(trim)
   @IsString()
   @MinLength(1)
   @MaxLength(5000)

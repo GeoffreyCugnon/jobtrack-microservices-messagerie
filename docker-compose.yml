@@ -50,8 +50,9 @@ services:
       # Required — fail fast if the operator forgot it.
       MESSAGING_JWT_SECRET: ${MESSAGING_JWT_SECRET:?set MESSAGING_JWT_SECRET}
       MESSAGING_CORS_ORIGINS: ${MESSAGING_CORS_ORIGINS:-http://localhost:5173}
-      # Compose runs the app behind no proxy; override per real deployment.
-      MESSAGING_TRUST_PROXY: ${MESSAGING_TRUST_PROXY:-false}
+      # Default assumes a single reverse-proxy hop in front (nginx/traefik/ingress
+      # — the common deploy shape). Set to `false` only for direct exposure.
+      MESSAGING_TRUST_PROXY: ${MESSAGING_TRUST_PROXY:-1}
       MESSAGING_JWT_MAX_AGE: ${MESSAGING_JWT_MAX_AGE:-}
       MESSAGING_CONTENT_ENCRYPTION_KEY: ${MESSAGING_CONTENT_ENCRYPTION_KEY:-}
     depends_on:

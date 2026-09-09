@@ -3,6 +3,7 @@ import {
   Controller,
   Delete,
   Get,
+  HttpCode,
   Param,
   ParseUUIDPipe,
   Patch,
@@ -92,6 +93,7 @@ export class MessagesController {
 
   /** POST /messages/:id/restore — restaure un message soft-deleté (expéditeur). */
   @Post('messages/:id/restore')
+  @HttpCode(200)
   restore(@CurrentUser() user: AuthUser, @Param('id', ParseUUIDPipe) id: string) {
     return this.messages.restore(id, user.id);
   }

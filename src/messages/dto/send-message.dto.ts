@@ -1,13 +1,19 @@
+import { Transform } from 'class-transformer';
 import { IsObject, IsOptional, IsString, Matches, MaxLength, MinLength } from 'class-validator';
 import { MaxJsonSize } from '../../common/max-json-size.validator';
+
+/** Retire les espaces de bord d'une chaîne (no-op sur les autres types). */
+const trim = ({ value }: { value: unknown }): unknown =>
+  typeof value === 'string' ? value.trim() : value;
 
 /** Corps de `POST /conversations/:id/messages` (et de l'événement WebSocket `message:send`). */
 export class SendMessageDto {
   /**
-   * Contenu textuel, non vide *après trim*, borné à 5 000 caractères. Le
-   * `@Matches(/\S/)` aligne le DTO sur `assertMessageContent` (défense en
-   * profondeur côté service), qui rejette déjà le contenu blanc.
+   * Contenu textuel, **trimé**, non vide, borné à 5 000 caractères. Le trim
+   * s'applique avant validation : `"   "` → `""` → rejeté. `@Matches(/\S/)`
+   * reste comme filet (aligné sur `assertMessageContent` côté service).
    */
+  @Transform(trim)
   @IsString()
   @MinLength(1)
   @MaxLength(5000)
