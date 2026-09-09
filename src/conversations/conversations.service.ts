@@ -202,11 +202,21 @@ export class ConversationsService {
 
   /**
    * Soft-delete d'une conversation (masquée pour les deux participants).
-   * Réservé à un participant. Idempotent. Les messages ne sont pas touchés :
+   * Réservé à un participant. Idempotent (une conversation déjà supprimée
+   * renvoie `{ deleted: true }`). Les messages ne sont pas touchés :
    * `findOrCreate` réactive la conversation si la paire la rouvre.
    */
   async softDelete(id: string, userId: string): Promise<{ deleted: true }> {
-    await this.getParticipantConversation(id, userId); // 404 si déjà supprimée / inconnue, 403 si non participant
+    const conversation = await this.prisma.conversation.findUnique({ where: { id } });
+    if (!conversation) {
+      throw new NotFoundException('Conversation not found');
+    }
+    if (conversation.userAId !== userId && conversation.userBId !== userId) {
+      throw new ForbiddenException('You are not a participant of this conversation');
+    }
+    if (conversation.deletedAt) {
+      return { deleted: true };
+    }
     await this.prisma.conversation.update({ where: { id }, data: { deletedAt: new Date() } });
     this.audit.log({
       userId,
