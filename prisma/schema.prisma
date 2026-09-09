@@ -34,6 +34,10 @@ model Conversation {
   lastMessageAt DateTime? @db.Timestamptz
   createdAt     DateTime  @default(now()) @db.Timestamptz
 
+  /// Soft-delete : non null = conversation masquée. `findOrCreate` la restaure
+  /// (remet à null) si la paire rouvre une conversation. Jamais purgée ici.
+  deletedAt DateTime? @db.Timestamptz
+
   /// Zone libre pour le projet hôte (titre, contexte…) ; non interprétée ici.
   metadata Json?
 
@@ -41,6 +45,8 @@ model Conversation {
 
   // Unicité de la paire d'utilisateurs (ordre normalisé en amont).
   @@unique([userAId, userBId])
+  // Filtre systématique `deletedAt IS NULL` sur les lectures.
+  @@index([deletedAt])
 }
 
 /// Message unitaire appartenant à une conversation.
@@ -51,14 +57,29 @@ model Message {
 
   /// Auteur du message (= claim `sub` du JWT).
   senderId String
-  content  String
+
+  /// Chiffré au repos (AES-256-GCM) quand `MESSAGING_CONTENT_ENCRYPTION_KEY` est
+  /// défini : préfixe `v1:` + iv + tag + ciphertext, base64. Sans clé, stocké en
+  /// clair (rétro-compatible). Cf. src/common/content-cipher.ts.
+  content String
 
   /// Null tant que le destinataire n'a pas marqué le message comme lu.
-  readAt    DateTime? @db.Timestamptz
-  createdAt DateTime  @default(now()) @db.Timestamptz
+  readAt DateTime? @db.Timestamptz
+
+  /// Soft-delete : non null = message masqué (exclu des lectures et de l'édition).
+  deletedAt DateTime? @db.Timestamptz
+
+  /// Historique d'édition. `editedAt` = dernière édition ; `editCount` = nombre
+  /// d'éditions ; le contenu antérieur est archivé dans MessageVersion.
+  editedAt  DateTime? @db.Timestamptz
+  editCount Int       @default(0)
+
+  createdAt DateTime @default(now()) @db.Timestamptz
 
   /// Zone libre pour le projet hôte (pièces jointes, type…) ; non interprétée ici.
   metadata Json?
+
+  versions MessageVersion[]
 
   // NB : un index partiel sur les messages non lus
   // (WHERE "readAt" IS NULL) est ajouté par une migration SQL manuelle,
@@ -66,4 +87,64 @@ model Message {
 
   // Sert la pagination par curseur (ORDER BY createdAt) filtrée par conversation.
   @@index([conversationId, createdAt])
+  @@index([deletedAt])
+}
+
+/// Contenu antérieur d'un message, archivé avant chaque édition (le plus ancien
+/// en premier via `createdAt`). Supprimé en cascade avec le message.
+model MessageVersion {
+  id        String   @id @default(uuid())
+  messageId String
+  message   Message  @relation(fields: [messageId], references: [id], onDelete: Cascade)
+  /// Chiffré au repos selon la même règle que Message.content.
+  content   String
+  createdAt DateTime @default(now()) @db.Timestamptz
+
+  @@index([messageId, createdAt])
+}
+
+/// Journal d'audit best-effort : trace qui a fait quoi. Écrit hors transaction
+/// métier (un échec d'audit ne casse jamais l'opération). Aucune route de lecture
+/// exposée pour l'instant (accès direct base / outil d'exploitation).
+model AuditLog {
+  id           String   @id @default(uuid())
+  /// Acteur (claim `sub` du JWT), ou `system` pour les actions internes.
+  userId       String
+  /// Verbe métier, ex. `message.sent`, `conversation.created`, `message.deleted`.
+  action       String
+  resourceType String?
+  resourceId   String?
+  /// Contexte libre non sensible (jamais le contenu d'un message).
+  details      Json?
+  createdAt    DateTime @default(now()) @db.Timestamptz
+
+  @@index([userId, createdAt])
+  @@index([action, createdAt])
+  @@index([resourceType, resourceId])
+}
+
+/// Outbox transactionnel : chaque événement d'intégration NATS est inséré dans
+/// la MÊME transaction Prisma que l'écriture métier qui le déclenche. Un job de
+/// fond (OutboxService) publie les lignes `publishedAt IS NULL`, avec retry à
+/// backoff. Garantit l'at-least-once même si le process crashe entre l'écriture
+/// et la publication.
+model OutboxEvent {
+  id            String    @id @default(uuid())
+  /// Sujet NATS (`messaging.message.created`, …).
+  subject       String
+  /// Payload déjà prêt à encoder (jamais de `content`).
+  payload       Json
+  createdAt     DateTime  @default(now()) @db.Timestamptz
+  /// Non null = publié avec succès sur NATS.
+  publishedAt   DateTime? @db.Timestamptz
+  attempts      Int       @default(0)
+  /// Prochaine tentative autorisée (backoff). Ignoré une fois `publishedAt` posé.
+  nextAttemptAt DateTime  @default(now()) @db.Timestamptz
+  lastError     String?
+  /// Non null = abandonné après épuisement des tentatives (inspection manuelle).
+  failedAt      DateTime? @db.Timestamptz
+
+  // Requête de drain : WHERE publishedAt IS NULL AND failedAt IS NULL AND nextAttemptAt <= now.
+  // Un index partiel `WHERE "publishedAt" IS NULL` est ajouté par migration SQL manuelle.
+  @@index([nextAttemptAt])
 }
