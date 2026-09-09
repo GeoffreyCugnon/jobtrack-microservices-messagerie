@@ -17,25 +17,29 @@
  * à Express).
  */
 
-const RAW = process.env.MESSAGING_TRUST_PROXY?.trim();
-
-/** Valeur à passer à `app.set('trust proxy', …)`. Défaut `1`. */
+/**
+ * Valeur à passer à `app.set('trust proxy', …)`. Défaut `1`.
+ *
+ * Lit `process.env` à l'appel (pas à l'import) : `main.ts` invoque cette fonction
+ * après `NestFactory.create`, une fois `ConfigModule` (dotenv) passé.
+ */
 export function trustProxySetting(): boolean | number | string {
-  if (RAW === undefined || RAW === '') {
+  const raw = process.env.MESSAGING_TRUST_PROXY?.trim();
+  if (raw === undefined || raw === '') {
     return 1;
   }
-  if (RAW.toLowerCase() === 'true') {
+  if (raw.toLowerCase() === 'true') {
     return true;
   }
-  if (RAW.toLowerCase() === 'false') {
+  if (raw.toLowerCase() === 'false') {
     return false;
   }
-  const asInt = Number(RAW);
+  const asInt = Number(raw);
   if (Number.isInteger(asInt) && asInt >= 0) {
     return asInt;
   }
   // 'loopback', 'uniquelocal', une IP, un CIDR, une liste séparée par des virgules…
-  return RAW;
+  return raw;
 }
 
 /** `true` si l'on doit faire confiance au header `X-Forwarded-For` (côté WebSocket). */
