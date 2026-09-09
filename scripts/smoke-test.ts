@@ -294,6 +294,33 @@ async function main(): Promise<void> {
       }
     }
 
+    // --- Étape 8bis : PATCH conversation read (userB) + conversation:read - //
+    log.step('PATCH /conversations/:id/messages/read (userB) — lecture en masse');
+    {
+      const convReadPromise = waitForEvent<{ conversationId: string; count: number }>(
+        socketB,
+        'conversation:read',
+        (p) => p.conversationId === conversationId,
+        RT_TIMEOUT_MS,
+      ).catch(() => undefined);
+      const bulkRes = await api<{ updated: number }>(
+        'PATCH',
+        `/conversations/${conversationId}/messages/read`,
+        tokenB,
+      );
+      record(
+        'markConversationRead (REST)',
+        bulkRes.status === 200 && typeof bulkRes.body?.updated === 'number',
+        `updated=${bulkRes.body?.updated ?? '—'} (HTTP ${bulkRes.status})`,
+      );
+      const evt = await convReadPromise;
+      record(
+        'conversation:read reçu (WS)',
+        !bulkRes.body?.updated || Boolean(evt),
+        evt ? `count=${evt.count}` : 'aucun message non lu → pas d’événement (attendu)',
+      );
+    }
+
     // --- Étape 9 : GET /conversations (userA) — lastMessageAt à jour ---- //
     log.step('GET /conversations (userA) — lastMessageAt mis à jour');
     const convListRes = await api<{
@@ -321,6 +348,7 @@ async function main(): Promise<void> {
     const msgCreated = bySubject(NATS_SUBJECTS.messageCreated);
     const msgRead = bySubject(NATS_SUBJECTS.messageRead);
     const convCreated = bySubject(NATS_SUBJECTS.conversationCreated);
+    const convRead = bySubject(NATS_SUBJECTS.conversationRead);
 
     record(
       `${NATS_SUBJECTS.messageCreated} publié`,
@@ -328,6 +356,13 @@ async function main(): Promise<void> {
       `${msgCreated.length} reçu(s)`,
     );
     record(`${NATS_SUBJECTS.messageRead} publié`, msgRead.length > 0, `${msgRead.length} reçu(s)`);
+    if (convRead.length > 0) {
+      record(`${NATS_SUBJECTS.conversationRead} publié`, true, `${convRead.length} reçu(s)`);
+    } else {
+      log.warn(
+        `${NATS_SUBJECTS.conversationRead} non reçu — normal si aucun message n'était non lu au moment du PATCH en masse.`,
+      );
+    }
     if (convCreated.length > 0) {
       record(`${NATS_SUBJECTS.conversationCreated} publié`, true, `${convCreated.length} reçu(s)`);
     } else {

@@ -1,6 +1,6 @@
 # MS-Messagerie
 
-Squelette d'un micro-service de **messagerie one-to-one** : NestJS + TypeScript + Prisma + PostgreSQL + Socket.IO, avec publication d'événements d'intégration sur **NATS**.
+Squelette d'un micro-service de **messagerie one-to-one** : NestJS 11 + TypeScript + Prisma 7 + PostgreSQL + Socket.IO, avec publication d'événements d'intégration sur **NATS** (via un **outbox transactionnel durable**).
 
 ## Nature du dépôt
 
@@ -35,23 +35,29 @@ npm run start:dev
 
 PostgreSQL et NATS doivent déjà être accessibles aux URLs renseignées dans `.env` avant de lancer ces commandes.
 
-Si NATS est injoignable au démarrage, le service **démarre quand même** : la connexion échoue en silence (log `warn`). Les événements d'intégration produits entre-temps sont mis en file et retentés par l'`OutboxService` (cf. plus bas) — mais cette file est **en mémoire** : elle est perdue si le process s'arrête.
+Si NATS est injoignable au démarrage, le service **démarre quand même** : `NatsConnectionManager` retente la connexion en tâche de fond (toutes les 10 s) jusqu'à réussir, puis s'appuie sur la reconnexion automatique de la lib. Les événements d'intégration produits entre-temps sont **persistés en base** (table `OutboxEvent`, écrite dans la transaction de l'écriture métier) et publiés dès que NATS revient — rien n'est perdu à un crash.
 
-En production : `npm run build && npm run prisma:migrate && npm run start:prod`.
+En production : `npm run build && npm run prisma:migrate && npm run start:prod`. Ou via Docker : voir *Déploiement Docker* plus bas.
 
 ## Endpoints REST
 
 | Méthode | Route | Description |
 |---|---|---|
-| `GET` | `/conversations` | Conversations de l'utilisateur authentifié, triées par `lastMessageAt` |
-| `POST` | `/conversations` | Ouvre (ou récupère) la conversation avec `{ "participantId": "..." }` |
+| `GET` | `/conversations` | Page de conversations de l'appelant (**curseur** : `?cursor=<id>&limit=<1..100>`, défaut 30), triées par `lastMessageAt` |
+| `POST` | `/conversations` | Ouvre (ou récupère) la conversation avec `{ "participantId": "..." }` — réactive une conversation supprimée |
+| `DELETE` | `/conversations/:id` | Soft-delete (masque la conversation pour les deux participants ; idempotent) |
+| `POST` | `/conversations/:id/restore` | Restaure une conversation soft-deletée |
 | `GET` | `/conversations/:id/messages` | Messages paginés **par curseur** (`?cursor=<messageId>&limit=<1..100>`, borné aussi côté service) |
 | `POST` | `/conversations/:id/messages` | Envoi d'un message — **fallback REST** si le WebSocket est indisponible |
 | `PATCH` | `/messages/:id/read` | Marque **un** message comme lu (interdit à l'expéditeur ; idempotent) |
 | `PATCH` | `/conversations/:id/messages/read` | Marque **tous** les messages reçus non lus de la conversation comme lus |
-| `GET` | `/health` | Sonde **publique** (sans JWT, hors rate limiting) : `{ status, database, nats }` |
+| `PATCH` | `/messages/:id` | Édite le contenu (**expéditeur uniquement** ; archive la version précédente ; idempotent si inchangé) |
+| `GET` | `/messages/:id/versions` | Historique d'édition (`{ id, content, createdAt }[]`, plus ancien d'abord ; participants) |
+| `DELETE` | `/messages/:id` | Soft-delete d'un message (**expéditeur uniquement** ; idempotent) |
+| `POST` | `/messages/:id/restore` | Restaure un message soft-deleté (expéditeur) |
+| `GET` | `/health` | Sonde **publique** (sans JWT, hors rate limiting) : `{ status, database, nats, outboxPending }` — **HTTP 503** si `database` est `down` |
 
-Pagination : la réponse est `{ "items": [...], "nextCursor": "<id|null>" }`. Repasser `nextCursor` dans `?cursor=` pour la page suivante. Les messages sont renvoyés du **plus récent au plus ancien**.
+Pagination (`GET /conversations` et `GET /conversations/:id/messages`) : la réponse est `{ "items": [...], "nextCursor": "<id|null>" }`. Repasser `nextCursor` dans `?cursor=` pour la page suivante. Les messages sont renvoyés du **plus récent au plus ancien** ; les conversations, les plus récemment actives d'abord.
 
 Toutes les routes REST **sauf `/health`** sont soumises à un rate limiting par IP (`429 Too Many Requests` au-delà) — cf. section *Rate limiting*.
 
@@ -73,8 +79,10 @@ La **connexion** WebSocket elle-même est rate-limitée par IP (10 tentatives / 
 
 | Événement | Portée | Payload |
 |---|---|---|
-| `message:new` | room `conversation:{id}` | le message créé |
+| `message:new` | room `conversation:{id}` | le message créé (contenu en clair) |
 | `message:read` | room `conversation:{id}` | `{ conversationId, messageId, readAt, readBy }` |
+| `message:edited` | room `conversation:{id}` | le message édité (contenu en clair) |
+| `message:deleted` | room `conversation:{id}` | `{ conversationId, messageId, deletedBy }` |
 | `conversation:read` | room `conversation:{id}` | `{ conversationId, readBy, readAt, count }` (après `PATCH …/messages/read`) |
 | `conversation:updated` | room perso `user:{id}` de chaque participant | `{ conversationId }` — signal léger pour rafraîchir la liste des conversations |
 
@@ -85,32 +93,45 @@ La diffusion est découplée des services métier via un `EventEmitter` interne 
 Ce service **publie** des événements sur NATS après chaque écriture réussie en base. C'est un **contrat d'intégration ouvert** : n'importe quel micro-service (par ex. un futur MS de notifications) peut s'y abonner pour réagir, **sans dépendance directe à ce service** et **sans jamais interroger sa base de données**.
 
 - NATS sert **uniquement** au pub/sub sortant. Les appels de l'application hôte vers ce service restent en **REST** ; NATS ne les remplace pas.
-- Publication **best-effort** via un **outbox en mémoire** ([src/nats/outbox.service.ts](src/nats/outbox.service.ts)) : `NatsPublisherService.publish()` met l'événement en file, tente une publication immédiate, puis **retente** en cas d'échec avec un backoff (1 s → 5 s → 30 s, 3 tentatives) + un job de drain périodique. Ne bloque jamais la transaction métier, ne relance jamais vers l'appelant.
-- ⚠️ File **en mémoire** : un crash du process perd les événements non encore publiés. L'outbox **transactionnel durable** (table Prisma écrite dans la même transaction que le message, garantie *at-least-once*) reste à faire.
-- Encodage : JSON (`JSONCodec`). Les `Date` sont sérialisées en ISO 8601.
+- **Outbox transactionnel durable** ([src/nats/outbox.service.ts](src/nats/outbox.service.ts)) : `OutboxService.enqueueInTx(tx, subject, payload)` insère la ligne `OutboxEvent` **dans la même transaction Prisma** que l'écriture métier. Un job de drain (toutes les 5 s + réveil après chaque commit) publie les lignes `publishedAt IS NULL` sur NATS, `flush()` avant de marquer publié, retente avec backoff `[1 s, 5 s, 15 s, 60 s, 300 s]` puis marque `failedAt`. Garantie **at-least-once** (consommateurs à rendre idempotents). Ne bloque jamais la transaction métier.
+- Encodage : JSON (`JSONCodec`). Les `Date` sont sérialisées en ISO 8601 (chaîne, stockée telle quelle dans `OutboxEvent.payload`).
 
 | Sujet | Payload | Déclenché après |
 |---|---|---|
 | `messaging.conversation.created` | `{ conversationId, userAId, userBId, createdAt }` | création d'une nouvelle conversation |
 | `messaging.message.created` | `{ messageId, conversationId, senderId, createdAt }` | envoi d'un message (**sans le contenu**) |
 | `messaging.message.read` | `{ messageId, conversationId, readAt }` | passage effectif d'un message à l'état lu |
+| `messaging.conversation.read` | `{ conversationId, readBy, readAt, count }` | lecture **en masse** (`PATCH …/messages/read`) — accusé agrégé |
 
-Configuration : `MESSAGING_NATS_URL` (ex. `nats://localhost:4222`). Le module `NatsModule` ouvre la connexion partagée ; `NatsPublisherService` (→ `OutboxService`) est appelé depuis `ConversationsService` et `MessagesService`.
+L'édition et la suppression de messages ne publient **pas** sur NATS (contrat volontairement restreint ; à étendre si un consommateur l'exige).
+
+Configuration : `MESSAGING_NATS_URL` (ex. `nats://localhost:4222`), `MESSAGING_OUTBOX_DRAIN_MS` (défaut 5000). `NatsConnectionManager` possède la connexion (reconnexion automatique + re-probe si down au démarrage) ; `OutboxService` est appelé depuis `ConversationsService` et `MessagesService`.
 
 ## Rate limiting
 
-- **REST** — `@nestjs/throttler`, par IP, sur toutes les routes sauf `/health`. `429 Too Many Requests` au-delà. Défaut **100 req / 60 s**, surchargeable : `MESSAGING_REST_THROTTLE_LIMIT`, `MESSAGING_REST_THROTTLE_TTL_MS`.
+- **REST** — `RestRateLimitGuard` (fenêtre glissante en mémoire, même implémentation que le WS ; `@nestjs/throttler` n'avait pas de version compatible NestJS 11/12), par IP, sur toutes les routes sauf `/health`. `429 Too Many Requests` au-delà. Défaut **100 req / 60 s**, surchargeable : `MESSAGING_REST_THROTTLE_LIMIT`, `MESSAGING_REST_THROTTLE_TTL_MS`.
 - **WebSocket** — `WsRateLimiterService` (fenêtre glissante en mémoire) :
   - `message:send` : **5 / 10 s par utilisateur** (`MESSAGING_WS_SEND_LIMIT`, `MESSAGING_WS_SEND_TTL_MS`) — `WsException` au-delà ;
   - handshake de connexion : **10 / 60 s par IP** (`MESSAGING_WS_CONNECT_LIMIT`, `MESSAGING_WS_CONNECT_TTL_MS`) — socket rejeté au-delà.
+- **Derrière un reverse proxy**, la clé de bucket doit être l'IP du client final, pas celle du proxy : `MESSAGING_TRUST_PROXY` (défaut `1` — un hop) pilote `app.set('trust proxy', …)` (Express → `req.ip` depuis `X-Forwarded-For`) et la résolution d'IP du handshake WebSocket. Mettre `false` pour une exposition directe.
 - Stockage **en mémoire process** : cohérent avec le modèle « une instance isolée par projet hôte ». Pour du multi-instance derrière un load-balancer, remplacer par un store partagé (Redis).
 - Les défauts sont volontairement plus permissifs que les valeurs indicatives de l'audit (cf. commentaires dans `.env.example`) : protéger d'un flood sans gêner un usage normal.
 
+## Sécurité complémentaire
+
+- **Chiffrement du contenu au repos** — si `MESSAGING_CONTENT_ENCRYPTION_KEY` (32 octets, base64/hex) est défini, `Message.content` et `MessageVersion.content` sont chiffrés en **AES-256-GCM** (format `v1:<iv>:<tag>:<ciphertext>`). Sans clé : stockage en clair, rétro-compatible. Les clients (REST + WebSocket) reçoivent **toujours** le contenu en clair ; les payloads NATS n'ont jamais porté de contenu. Les lignes en clair écrites avant l'activation de la clé restent lisibles — ne pas retirer/roter la clé tant que des lignes `v1:` existent.
+- **Expiration des tokens** — `MESSAGING_JWT_MAX_AGE` (ex. `24h`, `3600`) rejette tout JWT dont l'`iat` dépasse cet âge (garde-fou contre un token sans `exp`). Non activé par défaut.
+- **Journal d'audit** — `AuditService` (best-effort, ne bloque jamais) écrit dans la table `AuditLog` : `conversation.{created,deleted,restored,read}`, `message.{sent,read,edited,deleted,restored}`. Aucune route de lecture exposée (accès base / outil d'exploitation).
+- **Soft-delete** — conversations et messages portent un `deletedAt` ; toutes les lectures filtrent `deletedAt IS NULL`. Rien n'est purgé physiquement par le service.
+
 ## Modèle de données
 
-Voir [prisma/schema.prisma](prisma/schema.prisma). Deux modèles : `Conversation` et `Message`.
+Voir [prisma/schema.prisma](prisma/schema.prisma). Modèles : `Conversation`, `Message`, `MessageVersion`, `AuditLog`, `OutboxEvent`.
 
 - À l'insertion d'une conversation, l'ordre des identifiants est **normalisé** (`userAId < userBId`) pour qu'une même paire d'utilisateurs ne puisse jamais produire deux conversations (contrainte `@@unique([userAId, userBId])`).
+- `Conversation.deletedAt` / `Message.deletedAt` (soft-delete, indexés). `Message.editedAt` / `editCount` + `MessageVersion` (historique, cascade delete).
+- `OutboxEvent` : outbox transactionnel NATS (cf. *Événements d'intégration NATS*). Index partiel `idx_outbox_pending` sur `("nextAttemptAt") WHERE "publishedAt" IS NULL AND "failedAt" IS NULL`.
+- `AuditLog` : journal d'audit (index sur `userId`, `action`, `(resourceType, resourceId)`).
 - La migration [`20250101000100_unread_messages_partial_index`](prisma/migrations/20250101000100_unread_messages_partial_index/migration.sql) ajoute manuellement l'index **partiel** `idx_messages_unread` sur `("conversationId") WHERE "readAt" IS NULL`, qui reste petit et sert les recherches de messages non lus.
 
 Si Prisma signale une dérive sur la migration d'init (générée à la main pour que l'index partiel ait un socle), un `npm run prisma:migrate:dev -- --name init` sur une base vierge régénère un socle cohérent.
@@ -119,14 +140,16 @@ Si Prisma signale une dérive sur la migration d'init (générée à la main pou
 
 ```
 src/
-  auth/          AppAuthGuard (+ décorateur @Public), AuthService (vérif JWT), @CurrentUser
-  conversations/ ConversationsModule — création (ordre normalisé) et liste, publie messaging.conversation.created
-  messages/      MessagesModule — envoi, lecture, pagination par curseur, publie messaging.message.{created,read}
-  messaging/     MessagingGateway — Socket.IO, room par conversation ; WsRateLimiterService (throttle handshake + message:send)
-  nats/          NatsModule — connexion partagée, OutboxService (retry), NatsPublisherService, sujets & payloads d'intégration
-  health/        HealthController — GET /health public (sonde Prisma + NATS)
+  auth/          AppAuthGuard (+ @Public), AuthService (vérif JWT + maxAge optionnel), @CurrentUser
+  conversations/ ConversationsModule — création/liste paginée, soft-delete/restore, publie messaging.conversation.{created,read}
+  messages/      MessagesModule — envoi, lecture, pagination, édition + versions, soft-delete/restore ; ContentCipherService
+  messaging/     MessagingGateway — Socket.IO, room par conversation ; WsRateLimiterService ; WsExceptionFilter
+  nats/          NatsModule — NatsConnectionManager (reconnexion), OutboxService (outbox transactionnel durable), sujets & payloads
+  audit/         AuditModule — AuditService (journal best-effort, table AuditLog)
+  health/        HealthController — GET /health public (sonde Prisma + NATS + outbox pending ; 503 si DB down)
   prisma/        PrismaService / PrismaModule
-  common/        événements internes, CORS partagé, constantes de rate limiting, validateurs (assert, @MaxJsonSize)
+  common/        événements internes, CORS partagé, trust proxy, rate limit (guard REST + constantes), ContentCipherService,
+                 validateurs (assert, @MaxJsonSize), helpers de test
 scripts/
   smoke-test.ts  test manuel end-to-end sur infra réelle (npm run smoke-test)
 ```
@@ -134,13 +157,13 @@ scripts/
 ## Tests
 
 ```bash
-npm test          # ~60 tests unitaires : guard (+ @Public), services conversations & messages, gateway,
-                  #   OutboxService (retry/backoff), WsRateLimiterService, CORS, @MaxJsonSize
-npm run test:e2e  # e2e (Prisma + NATS mockés) : boot, guard sur /conversations, validation 400,
-                  #   throttle 429, GET /health public
+npm test          # ~96 tests unitaires : guard, services conversations & messages (envoi, lecture, édition/versions,
+                  #   soft-delete, transaction + outbox), OutboxService, NatsConnectionManager, ContentCipherService,
+                  #   AuditService, WsRateLimiterService, CORS, @MaxJsonSize
+npm run test:e2e  # e2e (Prisma + NATS mockés) : boot, guard sur les routes, validation 400, rate limit 429,
+                  #   GET /health public, routes soft-delete/edit guardées
+npm run typecheck # tsc --noEmit (src + test + scripts)
 ```
-
-Couverture indicative : ~64 % statements / ~55 % branches.
 
 ### Smoke test end-to-end (manuel, infra réelle)
 
@@ -155,10 +178,18 @@ Prérequis (tout doit déjà tourner) :
 npm run smoke-test
 ```
 
-Le script (via `tsx`, `dotenv` pour lire `.env`) : génère 2 JWT HS256 pour deux `sub` **UUID** fixes (`userA`, `userB`) avec la même lib que `AppAuthGuard` ; ouvre un abonnement NATS aux 3 sujets `messaging.*` **avant** toute écriture ; connecte un client Socket.IO authentifié en `userB` ; crée une conversation (`userA`), y poste un message (`userA`), vérifie la réception temps réel de `message:new` par `userB` (< 2 s), relit via REST, marque lu (`userB`), vérifie `message:read` et la mise à jour de `lastMessageAt` ; contrôle enfin que les événements NATS sont bien publiés et **ne contiennent jamais `content`**. Il ferme proprement les connexions et affiche un résumé `N/M vérifications réussies` (code de sortie `0` si tout passe, `1` sinon).
+Le script (via `tsx`, `dotenv` pour lire `.env`) : génère 2 JWT HS256 pour deux `sub` **UUID** fixes (`userA`, `userB`) avec la même lib que `AppAuthGuard` ; ouvre un abonnement NATS à tous les sujets `messaging.*` **avant** toute écriture ; connecte un client Socket.IO authentifié en `userB` ; crée une conversation (`userA`), y poste un message (`userA`), vérifie la réception temps réel de `message:new` par `userB` (< 2 s), relit via REST, marque lu (`userB`), vérifie `message:read` et la mise à jour de `lastMessageAt` ; contrôle enfin que les événements NATS sont bien publiés et **ne contiennent jamais `content`**. Il ferme proprement les connexions et affiche un résumé `N/M vérifications réussies` (code de sortie `0` si tout passe, `1` sinon).
 
 > `messaging.conversation.created` n'est émis qu'à la **création** de la paire : sur une 2ᵉ exécution avec les mêmes UUID, cette vérification est signalée en avertissement (non bloquant).
 
+## Déploiement Docker
+
+```bash
+MESSAGING_JWT_SECRET=$(openssl rand -hex 32) docker compose up --build
+```
+
+`docker-compose.yml` monte : `postgres` (avec healthcheck), `nats`, un service **`migrate`** one-shot (`prisma migrate deploy`, exécuté avant l'app) puis `ms-messagerie`. Le `Dockerfile` est multi-stage : `builder` (toolchain complète + `prisma generate` + `nest build`, réutilisé comme cible du `migrate`) et `runtime` (`node:20-alpine`, deps de prod uniquement, `dist/` — Prisma 7 en mode driver-adapter n'embarque pas de binaire moteur). Le healthcheck du conteneur interroge `GET /health` (503 si la base est injoignable). Variables surchargeables : `MESSAGING_CORS_ORIGINS`, `MESSAGING_TRUST_PROXY`, `MESSAGING_JWT_MAX_AGE`, `MESSAGING_CONTENT_ENCRYPTION_KEY`.
+
 ## Hors périmètre
 
-Pas de présence/typing, d'édition ou suppression de messages, ni de persistance des rooms. Côté NATS : la file de retry est **en mémoire** — pas d'outbox transactionnel durable, pas de garantie *at-least-once*. À compléter selon les besoins du projet hôte.
+Pas de présence/typing ni de persistance des rooms. Pas de `RolesGuard` (rôles/permissions). Côté durcissement, restent hors périmètre : `helmet`, logs structurés + request-id, métriques Prometheus, OpenAPI. À compléter selon les besoins du projet hôte.

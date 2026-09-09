@@ -60,9 +60,9 @@ Version : 0.1.0
 
 ---
 
-## 0 ter. Audit profond post-Phase 2 (2026-09-09) — ⚠️ NON TRAITÉ
+## 0 ter. Audit profond post-Phase 2 (2026-09-09) — ✅ TRAITÉ (voir §0 quater)
 
-Relecture du code réel (pas seulement des `CLAUDE.md`) + `npm audit`. Constats classés par sévérité. **Aucun n'est corrigé** — backlog.
+Relecture du code réel (pas seulement des `CLAUDE.md`) + `npm audit`. Constats classés par sévérité. **Tous corrigés** dans la passe §0 quater ci-dessous.
 
 ### 🔴 Critiques
 
@@ -93,6 +93,63 @@ Relecture du code réel (pas seulement des `CLAUDE.md`) + `npm audit`. Constats 
 Travail Phases 1-2 propre ; `findOrCreate` (normalisation paire + `P2002`) correct ; pagination curseur stable + `limit` clampé DTO **et** service ; payloads NATS sans `content` ; Prisma paramétré partout + index partiel unread ; TS strict, lint clean, 60 tests unitaires + 7 e2e (~64 %).
 
 **Priorité si mise en prod** : #2 (trust proxy) et #1 (reconnexion NATS) d'abord — les deux transforment un incident mineur en panne. Puis #3, #6, #7.
+
+---
+
+## 0 quater. Correction §0 ter + Phase 3 (2026-09-09, sur `develop`)
+
+`npm run build` ✓ · `npm run lint` ✓ · `npm run typecheck` ✓ · `npm test` **96 ✓** · `npm run test:e2e` **9 ✓** · `npm audit` **0**.
+
+Découverte en cours de route : **NestJS 12 est ESM-only** (tout l'arbre `@nestjs/*` en `"type": "module"`). Une montée en 12 imposait une migration ESM de tout le repo (tsconfig, Jest, format du client Prisma, tooling) — arbitrage : **NestJS 11** (dernier CJS), qui corrige les mêmes avis.
+
+### §0 ter — tous les constats
+
+| # | Constat | Correction |
+|---|---------|-----------|
+| **🔴 #1** | Outbox inopérant si NATS down au démarrage (`null` définitif) | `NatsConnectionManager` : `connect()` non bloquant + `{ reconnect: true, maxReconnectAttempts: -1 }` + re-probe 10 s tant que non connecté. Consommateurs lisent `.connection` à chaque usage. |
+| **🔴 #2** | Rate limiting cassé derrière un reverse proxy | `app.set('trust proxy', …)` (`src/common/trust-proxy.ts`, `MESSAGING_TRUST_PROXY`, défaut `1`) → `req.ip` depuis XFF ; côté WS `clientIpFromHandshake()` lit `x-forwarded-for`. |
+| **🟠 #3** | `GET /health` toujours 200 même DB down | `ServiceUnavailableException` → **503** quand `database: 'down'`. NATS down reste 200. Corps + `outboxPending`. |
+| **🟠 #4** | Erreurs `message:send` opaques côté WS | `WsExceptionFilter` sur la gateway : `HttpException` → `WsException` (status + message conservés). |
+| **🟠 #5** | `MessagesService.send` non transactionnel | `send` / `markRead` / `markConversationRead` + `findOrCreate` en `prisma.$transaction` (écriture métier + ligne d'outbox atomiques). |
+| **🟠 #6** | `npm audit` = 16 | `@nestjs/*` → `^11.2.x` (core ≥ 11.1.18 clôt GHSA-36xv-jgw5-4q75), `config` 4, `event-emitter` 3, `jwt` 11 ; Express 5. `overrides` : `multer ^2.3.0`, `lodash ^4.18.1`, `deepmerge-ts ^8.0.2`, `mysql2 ^3.24.4`. `@nestjs/throttler` retiré → `RestRateLimitGuard` maison (`SlidingWindowRateLimiter`). `npm audit` = **0**. |
+| **🟠 #7** | `smoke-test.ts` hors tsconfig/lint | Ajouté à `tsconfig.json` + glob lint/format ; `npm run typecheck`. Exclu de `nest build`. |
+| **🟡** | JWT sans `maxAge` | `MESSAGING_JWT_MAX_AGE` optionnel (off par défaut). |
+| **🟡** | `listForUser` non paginé (P6) | Curseur `?cursor&?limit` → **`GET /conversations` renvoie `{ items, nextCursor }`** (breaking ; e2e + smoke-test adaptés). |
+| **🟡** | `markConversationRead` sans event NATS | Sujet **`messaging.conversation.read`** ajouté. |
+| **🟡** | `ValidationPipe` gateway sans `forbidNonWhitelisted` | Ajouté. |
+| **🟡** | `assertMessageContent` plus strict que le DTO | `@Matches(/\S/)` sur `content` (REST + WS). |
+| **🟡** | `withTimeout` (health) ne `clearTimeout` pas | `.finally(() => clearTimeout(timer))`. |
+| **🟡** | Pas de métrique `pendingCount` | `OutboxService.countPending()` exposé dans `/health`. |
+
+### Phase 3 CLAUDE.md — outbox durable + chiffrement
+
+- **Outbox transactionnel durable** : table `OutboxEvent` + index partiel `idx_outbox_pending`. `enqueueInTx(tx, subject, payload)` dans la transaction métier ; `drain()` publie + `flush()` + marque publié, retry `[1s,5s,15s,60s,300s]` puis `failedAt`. **at-least-once**. `NatsPublisherService` + file mémoire supprimés.
+- **Chiffrement au repos** : `ContentCipherService`, AES-256-GCM, `MESSAGING_CONTENT_ENCRYPTION_KEY` (32 o). Format `v1:…`. Sans clé → passe-plat rétro-compatible. `Message.content` + `MessageVersion.content`. Clients toujours en clair ; NATS jamais de contenu.
+
+### Phase 3 dossier `Claude outputs/` (hors monitoring/Prometheus, écarté explicitement)
+
+- **Soft-delete** : `deletedAt` sur `Conversation` / `Message`. `DELETE /conversations/:id` + `.../restore` (participant) ; `DELETE /messages/:id` + `.../restore` (expéditeur). `findOrCreate` réactive. Lectures filtrent `deletedAt IS NULL`.
+- **Audit trail** : `AuditModule` (`@Global`), `AuditService.log()` best-effort → `AuditLog`. Pas de route de lecture.
+- **Édition + versioning** : `editedAt` / `editCount` + table `MessageVersion` (cascade, chiffrée). `PATCH /messages/:id` (expéditeur, archive, idempotent) + `GET /messages/:id/versions` (participants). Événements WS `message:edited` / `message:deleted`. Pas de sujet NATS pour edit/delete.
+
+### Durcissement — Docker (seul item retenu Q4)
+
+- `Dockerfile` multi-stage + `docker-compose.yml` (`postgres` healthcheck + `nats` + `migrate` one-shot + app healthcheck `/health`). **Non build-testé** (pas de Docker dans l'environnement).
+- **Non retenus** : `helmet`, filtre d'exceptions global + logs structurés + request-id, workflow CI.
+
+### Migrations
+
+- `20260909090042_phase3_soft_delete_audit_versioning_outbox`
+- `20260909090100_outbox_pending_partial_index`
+
+### Reste ouvert (non bloquant)
+
+- `RolesGuard` (rôles/permissions) toujours absent.
+- Durcissement : `helmet`, logs structurés + request-id, métriques Prometheus, OpenAPI, CI (voir §10).
+- `AuditLog` : pas de route de lecture ni de rétention. `MessageVersion` : historique visible de tous les participants (assumé).
+- Rate limiting toujours en mémoire process (pas de Redis partagé).
+- Pagination `listForUser` : `lastMessageAt` mouvant peut décaler une conversation entre deux pages (compromis documenté).
+- Image Docker `runtime` non testée en build réel.
 
 ---
 
