@@ -1,0 +1,73 @@
+# Local / prod-like stack for MS-Messagerie.
+#
+#   MESSAGING_JWT_SECRET=... docker compose up --build
+#
+# One isolated instance per host project: a dedicated Postgres, a NATS the host's
+# other services also connect to. Migrations run once via the `migrate` service
+# before the app starts.
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: messaging
+      POSTGRES_USER: messaging
+      POSTGRES_PASSWORD: messaging
+    volumes:
+      - messaging-pg:/var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U messaging -d messaging']
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  nats:
+    image: nats:2-alpine
+    ports:
+      - '4222:4222'
+
+  migrate:
+    build:
+      context: .
+      target: builder
+    command: npx prisma migrate deploy
+    environment:
+      MESSAGING_DATABASE_URL: postgresql://messaging:messaging@postgres:5432/messaging?schema=public
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  ms-messagerie:
+    build:
+      context: .
+      target: runtime
+    ports:
+      - '3100:3100'
+    environment:
+      PORT: '3100'
+      MESSAGING_DATABASE_URL: postgresql://messaging:messaging@postgres:5432/messaging?schema=public
+      MESSAGING_NATS_URL: nats://nats:4222
+      # Required — fail fast if the operator forgot it.
+      MESSAGING_JWT_SECRET: ${MESSAGING_JWT_SECRET:?set MESSAGING_JWT_SECRET}
+      MESSAGING_CORS_ORIGINS: ${MESSAGING_CORS_ORIGINS:-http://localhost:5173}
+      # Compose runs the app behind no proxy; override per real deployment.
+      MESSAGING_TRUST_PROXY: ${MESSAGING_TRUST_PROXY:-false}
+      MESSAGING_JWT_MAX_AGE: ${MESSAGING_JWT_MAX_AGE:-}
+      MESSAGING_CONTENT_ENCRYPTION_KEY: ${MESSAGING_CONTENT_ENCRYPTION_KEY:-}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      nats:
+        condition: service_started
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      # GET /health returns 503 when the DB probe fails -> unhealthy container.
+      test: ['CMD-SHELL', 'wget -qO- http://localhost:3100/health || exit 1']
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+
+volumes:
+  messaging-pg:

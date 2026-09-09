@@ -1,0 +1,12 @@
+node_modules
+dist
+coverage
+.git
+.gitignore
+.env
+*.log
+.DS_Store
+Claude outputs
+CLAUDE.md
+README.md
+**/*.spec.ts
