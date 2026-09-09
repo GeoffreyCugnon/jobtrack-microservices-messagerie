@@ -60,6 +60,42 @@ Version : 0.1.0
 
 ---
 
+## 0 ter. Audit profond post-Phase 2 (2026-09-09) — ⚠️ NON TRAITÉ
+
+Relecture du code réel (pas seulement des `CLAUDE.md`) + `npm audit`. Constats classés par sévérité. **Aucun n'est corrigé** — backlog.
+
+### 🔴 Critiques
+
+1. **L'outbox NATS est inopérant si le broker est down au démarrage.** `natsConnectionProvider` (`src/nats/nats.provider.ts:24`) renvoie `null` définitivement sur échec de `connect()` (aucune reconnexion). `OutboxService` retente alors chaque événement contre `null` : 3 essais / ~36 s puis abandon **définitif**, même si NATS revient. → connecter avec `{ reconnect: true, maxReconnectAttempts: -1, waitOnFirstConnect: true }` **ou** rendre l'accès connexion *lazy* dans `OutboxService`.
+2. **Rate limiting cassé derrière un reverse proxy.** Pas de `app.set('trust proxy', …)` ni de lecture `X-Forwarded-For`. `req.ip` (throttler REST) et `client.handshake.address` (`messaging.gateway.ts:45`, `ipOf()`) valent l'IP **du proxy** → tous les clients dans un seul bucket : 100 req/60 s et 10 conn/60 s pour l'app entière en prod. Auto-DoS. → `trust proxy` + tracker throttler sur `X-Forwarded-For` ; côté WS lire `handshake.headers['x-forwarded-for']`.
+
+### 🟠 Moyens
+
+3. **`GET /health` renvoie toujours HTTP 200**, même `database: 'down'` (`status: 'degraded'` dans le body seulement) → inexploitable comme *readiness probe*. → `throw new ServiceUnavailableException(report)` quand `status !== 'ok'`.
+4. **Erreurs `message:send` opaques côté client WS.** `getParticipantConversation` lève `NotFound/ForbiddenException` (HTTP) ; en contexte WS Nest ne formate proprement que `WsException` → le client reçoit un générique `"Internal server error"`. → filtre `BaseWsExceptionFilter` mappant `HttpException → WsException`.
+5. **`MessagesService.send` non transactionnel** (`messages.service.ts` : `message.create` puis `conversation.update({lastMessageAt})` séparés). Échec de la 2ᵉ écriture → `lastMessageAt` périmé, tri faux dans `listForUser`. → `prisma.$transaction`.
+6. **Vulns dépendances** : `npm audit` = 16 (7 high / 8 moderate). Runtime : `qs` + `multer` (DoS) via `@nestjs/platform-express` — `npm audit fix` (non-breaking) suffit. `mysql2` (high) = CLI Prisma (devDep), pas exposé. NestJS figé en 10.4 (latest 12) — fenêtre de maintenance 10.x qui se referme.
+7. **`scripts/smoke-test.ts` hors `tsconfig` / lint / build** — non typé-checké (c'est ainsi que le `participantId` cassé par le `@IsUUID` de Phase 1 est passé ; corrigé en 2026-09-09 avec 2 UUID fixes). → `tsconfig.scripts.json` dédié + ajout au lint / CI.
+
+### 🟡 Mineurs
+
+- JWT sans `maxAge` (`auth.module.ts:25`) : un token sans `exp` ne périme jamais.
+- `listForUser` non paginé (P6, toujours ouvert).
+- `markConversationRead` ne publie aucun événement NATS (tradeoff documenté) → consommateur d'accusés de lecture rate les lectures en masse ; envisager `messaging.conversation.read`.
+- `ValidationPipe` de la gateway sans `forbidNonWhitelisted` (REST l'a) → DTO WS strippent au lieu de rejeter.
+- `OutboxService` jette les événements **les plus récents** au débordement `MAX_PENDING` (ring buffer = meilleur mode de défaillance) ; pas de métrique `pendingCount`.
+- `assertMessageContent` (rejette whitespace-only) plus strict que `@MinLength(1)` du DTO.
+- `withTimeout` (health) ne `clearTimeout` pas le timer perdant (unref'd, non fatal).
+- Absents (backlog durcissement, déjà en §10) : `helmet`, filtre d'exceptions global, logs structurés + request-id, métriques Prometheus, OpenAPI, `Dockerfile`/compose, **workflow CI**.
+
+### ✅ Vérifié sain
+
+Travail Phases 1-2 propre ; `findOrCreate` (normalisation paire + `P2002`) correct ; pagination curseur stable + `limit` clampé DTO **et** service ; payloads NATS sans `content` ; Prisma paramétré partout + index partiel unread ; TS strict, lint clean, 60 tests unitaires + 7 e2e (~64 %).
+
+**Priorité si mise en prod** : #2 (trust proxy) et #1 (reconnexion NATS) d'abord — les deux transforment un incident mineur en panne. Puis #3, #6, #7.
+
+---
+
 ## 1. Architecture générale
 
 ### 1.1 Modèle de déploiement
