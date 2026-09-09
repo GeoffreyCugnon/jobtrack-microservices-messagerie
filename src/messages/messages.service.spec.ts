@@ -451,6 +451,23 @@ describe('MessagesService', () => {
     });
   });
 
+  describe('getOne', () => {
+    it('returns the decrypted message for a participant', async () => {
+      prisma.message.findUnique.mockResolvedValue(makeMessage({ id: 'm1', content: 'enc(hi)' }));
+
+      const res = await service.getOne('m1', TEST_USERS.bob);
+
+      expect(res.content).toBe('hi');
+      expect(conversations.getParticipantConversation).toHaveBeenCalled();
+    });
+
+    it('404s for an unknown or soft-deleted message', async () => {
+      prisma.message.findUnique.mockResolvedValue(makeMessage({ deletedAt: new Date() }));
+
+      await expect(service.getOne('m1', TEST_USERS.bob)).rejects.toBeInstanceOf(NotFoundException);
+    });
+  });
+
   describe('assertParticipant', () => {
     it('delegates to ConversationsService.getParticipantConversation', async () => {
       await service.assertParticipant(TEST_CONVERSATION_ID, TEST_USERS.alice);

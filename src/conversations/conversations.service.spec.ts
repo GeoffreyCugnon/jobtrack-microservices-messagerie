@@ -24,7 +24,7 @@ describe('ConversationsService', () => {
       update: jest.Mock;
       create: jest.Mock;
     };
-    message: { groupBy: jest.Mock };
+    message: { groupBy: jest.Mock; count: jest.Mock };
   };
   let outbox: { enqueueInTx: jest.Mock; wake: jest.Mock };
   let audit: { log: jest.Mock };
@@ -40,7 +40,7 @@ describe('ConversationsService', () => {
         update: jest.fn(),
         create: jest.fn(),
       },
-      message: { groupBy: jest.fn() },
+      message: { groupBy: jest.fn(), count: jest.fn().mockResolvedValue(0) },
     };
     outbox = { enqueueInTx: jest.fn().mockResolvedValue({ id: 'evt' }), wake: jest.fn() };
     audit = { log: jest.fn() };
@@ -251,6 +251,35 @@ describe('ConversationsService', () => {
       await expect(
         service.getParticipantConversation(TEST_CONVERSATION_ID, TEST_USERS.bob),
       ).resolves.toBe(conversation);
+    });
+  });
+
+  describe('getOneForUser', () => {
+    it('returns the conversation with its unreadCount', async () => {
+      prisma.conversation.findUnique.mockResolvedValue(makeConversation({ id: 'c9' }));
+      prisma.message.count.mockResolvedValue(2);
+
+      const res = await service.getOneForUser('c9', TEST_USERS.bob);
+
+      expect(res).toMatchObject({ id: 'c9', unreadCount: 2 });
+      expect(prisma.message.count).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: {
+            conversationId: 'c9',
+            senderId: { not: TEST_USERS.bob },
+            readAt: null,
+            deletedAt: null,
+          },
+        }),
+      );
+    });
+
+    it('404s for a non-participant / unknown conversation', async () => {
+      prisma.conversation.findUnique.mockResolvedValue(null);
+
+      await expect(service.getOneForUser('c9', TEST_USERS.bob)).rejects.toBeInstanceOf(
+        NotFoundException,
+      );
     });
   });
 

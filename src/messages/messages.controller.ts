@@ -79,6 +79,12 @@ export class MessagesController {
     return this.messages.edit(id, user.id, dto);
   }
 
+  /** GET /messages/:id — un message par id (participants ; 404 si supprimé). */
+  @Get('messages/:id')
+  getOne(@CurrentUser() user: AuthUser, @Param('id', ParseUUIDPipe) id: string) {
+    return this.messages.getOne(id, user.id);
+  }
+
   /** GET /messages/:id/versions — historique d'édition (participants). */
   @Get('messages/:id/versions')
   versions(@CurrentUser() user: AuthUser, @Param('id', ParseUUIDPipe) id: string) {

@@ -400,6 +400,19 @@ export class MessagesService {
   }
 
   /**
+   * Un message par id (contenu déchiffré). Réservé aux participants de la
+   * conversation ; 404 si inconnu ou soft-deleté.
+   */
+  async getOne(messageId: string, userId: string): Promise<Message> {
+    const message = await this.prisma.message.findUnique({ where: { id: messageId } });
+    if (!message || message.deletedAt) {
+      throw new NotFoundException('Message not found');
+    }
+    await this.conversations.getParticipantConversation(message.conversationId, userId);
+    return this.decrypted(message);
+  }
+
+  /**
    * Historique d'édition d'un message (le plus ancien en premier). Accessible
    * aux deux participants de la conversation.
    */

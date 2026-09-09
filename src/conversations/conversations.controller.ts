@@ -33,6 +33,12 @@ export class ConversationsController {
     return this.conversations.listForUser(user.id, query.cursor, query.limit);
   }
 
+  /** GET /conversations/:id — une conversation de l'appelant (avec `unreadCount`). */
+  @Get(':id')
+  getOne(@CurrentUser() user: AuthUser, @Param('id', ParseUUIDPipe) id: string) {
+    return this.conversations.getOneForUser(id, user.id);
+  }
+
   /**
    * POST /conversations — ouvre (ou retrouve) la conversation one-to-one avec
    * l'utilisateur `participantId`. Idempotent : deux appels renvoient la même

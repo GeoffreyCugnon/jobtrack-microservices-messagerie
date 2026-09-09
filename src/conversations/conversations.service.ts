@@ -184,6 +184,18 @@ export class ConversationsService {
   }
 
   /**
+   * Une conversation de l'appelant, avec son `unreadCount` (comme dans la liste).
+   * Réservé à un participant ; 404 si inconnue ou supprimée.
+   */
+  async getOneForUser(id: string, userId: string): Promise<ConversationWithUnread> {
+    const conversation = await this.getParticipantConversation(id, userId);
+    const unread = await this.prisma.message.count({
+      where: { conversationId: id, senderId: { not: userId }, readAt: null, deletedAt: null },
+    });
+    return { ...conversation, unreadCount: unread };
+  }
+
+  /**
    * Charge une conversation non supprimée et vérifie que `userId` en est bien
    * participant.
    * @throws NotFoundException  conversation inconnue ou supprimée
