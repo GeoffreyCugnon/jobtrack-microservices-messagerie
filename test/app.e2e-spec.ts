@@ -81,13 +81,13 @@ describe('Messaging skeleton (e2e)', () => {
     return request(http()).get('/conversations').expect(401);
   });
 
-  it('serves GET /conversations for an authenticated user', async () => {
+  it('serves GET /conversations for an authenticated user (paginated shape)', async () => {
     const res = await request(http())
       .get('/conversations')
       .set('Authorization', auth())
       .expect(200);
 
-    expect(res.body).toEqual([]);
+    expect(res.body).toEqual({ items: [], nextCursor: null });
     expect(prismaMock.conversation.findMany).toHaveBeenCalled();
   });
 

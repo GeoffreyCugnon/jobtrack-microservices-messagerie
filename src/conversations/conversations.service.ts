@@ -9,6 +9,17 @@ import { PrismaService } from '../prisma/prisma.service';
 /** Conversation enrichie du nombre de messages non lus pour l'appelant. */
 export type ConversationWithUnread = Conversation & { unreadCount: number };
 
+/** Page de conversations : `nextCursor` = id à repasser en `?cursor=`. */
+export interface ConversationPage {
+  items: ConversationWithUnread[];
+  nextCursor: string | null;
+}
+
+/** Taille de page par défaut de `listForUser`. */
+const DEFAULT_PAGE_SIZE = 30;
+/** Borne dure, même si un appelant contourne le DTO. */
+const MAX_PAGE_SIZE = 100;
+
 /**
  * Création et récupération des conversations one-to-one.
  *
@@ -44,18 +55,41 @@ export class ConversationsService {
   }
 
   /**
-   * Conversations non supprimées de l'utilisateur, les plus récemment actives
-   * d'abord (null en dernier), chacune avec `unreadCount` = nombre de messages
-   * reçus (donc pas envoyés par lui) encore non lus. Le décompte se fait en une
-   * seule requête `groupBy` (index partiel `WHERE "readAt" IS NULL` en base).
+   * Page de conversations non supprimées de l'utilisateur, les plus récemment
+   * actives d'abord (`lastMessageAt` null en dernier), chacune avec `unreadCount`
+   * = nombre de messages reçus (donc pas envoyés par lui) encore non lus. Le
+   * décompte se fait en une seule requête `groupBy` sur les ids de la page
+   * (index partiel `WHERE "readAt" IS NULL` en base).
+   *
+   * Pagination par curseur : `id` sert de tie-breaker stable. `lastMessageAt`
+   * évoluant à chaque message, une conversation peut changer de page entre deux
+   * requêtes — acceptable pour une liste de conversations (même compromis que la
+   * pagination des messages).
    */
-  async listForUser(userId: string): Promise<ConversationWithUnread[]> {
-    const conversations = await this.prisma.conversation.findMany({
+  async listForUser(
+    userId: string,
+    cursor?: string,
+    limit: number = DEFAULT_PAGE_SIZE,
+  ): Promise<ConversationPage> {
+    const safeLimit = Math.min(Math.max(Math.trunc(limit) || DEFAULT_PAGE_SIZE, 1), MAX_PAGE_SIZE);
+    const take = safeLimit + 1;
+    const rows = await this.prisma.conversation.findMany({
       where: { OR: [{ userAId: userId }, { userBId: userId }], deletedAt: null },
-      orderBy: [{ lastMessageAt: { sort: 'desc', nulls: 'last' } }, { createdAt: 'desc' }],
+      orderBy: [
+        { lastMessageAt: { sort: 'desc', nulls: 'last' } },
+        { createdAt: 'desc' },
+        { id: 'desc' },
+      ],
+      take,
+      ...(cursor ? { cursor: { id: cursor }, skip: 1 } : {}),
     });
+
+    const hasMore = rows.length === take;
+    const conversations = hasMore ? rows.slice(0, safeLimit) : rows;
+    const nextCursor = hasMore ? conversations[conversations.length - 1].id : null;
+
     if (conversations.length === 0) {
-      return [];
+      return { items: [], nextCursor };
     }
 
     const unreadGroups = await this.prisma.message.groupBy({
@@ -72,10 +106,13 @@ export class ConversationsService {
       unreadGroups.map((group) => [group.conversationId, group._count._all]),
     );
 
-    return conversations.map((conversation) => ({
-      ...conversation,
-      unreadCount: unreadByConversation.get(conversation.id) ?? 0,
-    }));
+    return {
+      items: conversations.map((conversation) => ({
+        ...conversation,
+        unreadCount: unreadByConversation.get(conversation.id) ?? 0,
+      })),
+      nextCursor,
+    };
   }
 
   /**

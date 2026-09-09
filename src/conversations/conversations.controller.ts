@@ -1,8 +1,9 @@
-import { Body, Controller, Delete, Get, Param, ParseUUIDPipe, Post } from '@nestjs/common';
+import { Body, Controller, Delete, Get, Param, ParseUUIDPipe, Post, Query } from '@nestjs/common';
 import { AuthUser } from '../auth/auth-user.interface';
 import { CurrentUser } from '../auth/current-user.decorator';
 import { ConversationsService } from './conversations.service';
 import { CreateConversationDto } from './dto/create-conversation.dto';
+import { ListConversationsQueryDto } from './dto/list-conversations-query.dto';
 
 /**
  * Routes REST des conversations. Toutes protégées par AppAuthGuard (APP_GUARD) :
@@ -12,10 +13,14 @@ import { CreateConversationDto } from './dto/create-conversation.dto';
 export class ConversationsController {
   constructor(private readonly conversations: ConversationsService) {}
 
-  /** GET /conversations — conversations de l'appelant, triées par lastMessageAt. */
+  /**
+   * GET /conversations — page de conversations de l'appelant, triées par
+   * `lastMessageAt`. Réponse : `{ items, nextCursor }` (curseur = `?cursor=<id>`,
+   * taille `?limit=` 1–100, défaut 30).
+   */
   @Get()
-  list(@CurrentUser() user: AuthUser) {
-    return this.conversations.listForUser(user.id);
+  list(@CurrentUser() user: AuthUser, @Query() query: ListConversationsQueryDto) {
+    return this.conversations.listForUser(user.id, query.cursor, query.limit);
   }
 
   /**

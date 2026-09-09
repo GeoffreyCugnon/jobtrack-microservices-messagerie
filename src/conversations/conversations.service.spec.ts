@@ -142,10 +142,10 @@ describe('ConversationsService', () => {
   });
 
   describe('listForUser', () => {
-    it('returns an empty array (and skips the groupBy) when the user has no conversations', async () => {
+    it('returns an empty page (and skips the groupBy) when the user has no conversations', async () => {
       prisma.conversation.findMany.mockResolvedValue([]);
 
-      expect(await service.listForUser(TEST_USERS.alice)).toEqual([]);
+      expect(await service.listForUser(TEST_USERS.alice)).toEqual({ items: [], nextCursor: null });
       expect(prisma.message.groupBy).not.toHaveBeenCalled();
     });
 
@@ -167,12 +167,16 @@ describe('ConversationsService', () => {
             OR: [{ userAId: TEST_USERS.alice }, { userBId: TEST_USERS.alice }],
             deletedAt: null,
           },
+          take: 31,
         }),
       );
-      expect(result).toEqual([
-        { ...c1, unreadCount: 4 },
-        { ...c2, unreadCount: 0 },
-      ]);
+      expect(result).toEqual({
+        items: [
+          { ...c1, unreadCount: 4 },
+          { ...c2, unreadCount: 0 },
+        ],
+        nextCursor: null,
+      });
       expect(prisma.message.groupBy).toHaveBeenCalledWith(
         expect.objectContaining({
           by: ['conversationId'],
@@ -183,6 +187,34 @@ describe('ConversationsService', () => {
             deletedAt: null,
           },
         }),
+      );
+    });
+
+    it('paginates: with limit N and N+1 rows, drops the extra and returns its predecessor as nextCursor', async () => {
+      const rows = [
+        makeConversation({ id: 'c1' }),
+        makeConversation({ id: 'c2' }),
+        makeConversation({ id: 'c3' }),
+      ];
+      prisma.conversation.findMany.mockResolvedValue(rows);
+      prisma.message.groupBy.mockResolvedValue([]);
+
+      const page = await service.listForUser(TEST_USERS.alice, undefined, 2);
+
+      expect(prisma.conversation.findMany).toHaveBeenCalledWith(
+        expect.objectContaining({ take: 3 }),
+      );
+      expect(page.items.map((c) => c.id)).toEqual(['c1', 'c2']);
+      expect(page.nextCursor).toBe('c2');
+    });
+
+    it('passes the cursor through with skip: 1 and clamps an oversized limit', async () => {
+      prisma.conversation.findMany.mockResolvedValue([]);
+
+      await service.listForUser(TEST_USERS.alice, 'cursor-id', 100_000);
+
+      expect(prisma.conversation.findMany).toHaveBeenCalledWith(
+        expect.objectContaining({ cursor: { id: 'cursor-id' }, skip: 1, take: 101 }),
       );
     });
   });

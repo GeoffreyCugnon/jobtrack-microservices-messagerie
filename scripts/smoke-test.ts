@@ -296,13 +296,12 @@ async function main(): Promise<void> {
 
     // --- Étape 9 : GET /conversations (userA) — lastMessageAt à jour ---- //
     log.step('GET /conversations (userA) — lastMessageAt mis à jour');
-    const convListRes = await api<{ id: string; lastMessageAt: string | null }[]>(
-      'GET',
-      '/conversations',
-      tokenA,
-    );
-    const conv = Array.isArray(convListRes.body)
-      ? convListRes.body.find((c) => c.id === conversationId)
+    const convListRes = await api<{
+      items: { id: string; lastMessageAt: string | null }[];
+      nextCursor: string | null;
+    }>('GET', '/conversations', tokenA);
+    const conv = Array.isArray(convListRes.body?.items)
+      ? convListRes.body.items.find((c) => c.id === conversationId)
       : undefined;
     const lastMessageAtOk =
       Boolean(conv?.lastMessageAt) &&
