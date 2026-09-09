@@ -70,9 +70,32 @@ export class MessagesService {
     private readonly audit: AuditService,
   ) {}
 
-  /** Renvoie une copie du message avec `content` déchiffré (lecture). */
+  /**
+   * Renvoie une copie du message avec `content` déchiffré (lecture).
+   *
+   * Tolérant : si le déchiffrement échoue (clé absente/rotée, ligne corrompue),
+   * on ne fait pas planter la lecture — le message est renvoyé avec un contenu
+   * de remplacement et l'erreur est journalisée. Un `GET /messages` qui renvoie
+   * `[message indisponible]` reste préférable à un 500 sur toute la page.
+   */
   private decrypted(message: Message): Message {
-    return { ...message, content: this.cipher.decrypt(message.content) };
+    try {
+      return { ...message, content: this.cipher.decrypt(message.content) };
+    } catch (err) {
+      this.logger.error(`Failed to decrypt message ${message.id}: ${(err as Error).message}`);
+      return { ...message, content: '[contenu indisponible]' };
+    }
+  }
+
+  /**
+   * Vérifie que `userId` est bien participant de `conversationId`. Utilisé par la
+   * gateway avant de laisser une socket rejoindre la room d'une conversation
+   * (les routes REST font ce contrôle partout ; la room WS doit l'avoir aussi).
+   * @throws NotFoundException / ForbiddenException (mappées en WsException par le filtre)
+   */
+  async assertParticipant(conversationId: string, userId: string): Promise<void> {
+    assertUuid(conversationId, 'conversationId');
+    await this.conversations.getParticipantConversation(conversationId, userId);
   }
 
   /**
@@ -94,6 +117,16 @@ export class MessagesService {
       this.outbox.wake();
     } catch (err) {
       this.logger.error(`Failed to wake outbox: ${(err as Error).message}`);
+    }
+  }
+
+  /** Déchiffrement tolérant d'une chaîne isolée (contenu de `MessageVersion`). */
+  private safeDecrypt(stored: string, ref: string): string {
+    try {
+      return this.cipher.decrypt(stored);
+    } catch (err) {
+      this.logger.error(`Failed to decrypt ${ref}: ${(err as Error).message}`);
+      return '[contenu indisponible]';
     }
   }
 
@@ -326,7 +359,9 @@ export class MessagesService {
     if (message.senderId !== userId) {
       throw new ForbiddenException('Only the sender can edit this message');
     }
-    if (this.cipher.decrypt(message.content) === dto.content) {
+    // Idempotence : si l'actuel est illisible, on ne court-circuite pas — on
+    // laisse l'édition écraser (safeDecrypt renvoie un sentinel non égal au DTO).
+    if (this.safeDecrypt(message.content, `message ${message.id}`) === dto.content) {
       return this.decrypted(message);
     }
 
@@ -381,7 +416,7 @@ export class MessagesService {
     });
     return versions.map((v: MessageVersion) => ({
       id: v.id,
-      content: this.cipher.decrypt(v.content),
+      content: this.safeDecrypt(v.content, `version ${v.id}`),
       createdAt: v.createdAt,
     }));
   }

@@ -1,5 +1,5 @@
 import { WsException } from '@nestjs/websockets';
-import { UnauthorizedException } from '@nestjs/common';
+import { ForbiddenException, UnauthorizedException } from '@nestjs/common';
 import { AuthService } from '../auth/auth.service';
 import { TEST_CONVERSATION_ID, TEST_USERS, makeMessage } from '../common/test-fixtures';
 import { MessagesService } from '../messages/messages.service';
@@ -12,7 +12,7 @@ import { WsRateLimiterService } from './rate-limiter.service';
  */
 describe('MessagingGateway', () => {
   let authService: { verifyToken: jest.Mock };
-  let messages: { send: jest.Mock };
+  let messages: { send: jest.Mock; assertParticipant: jest.Mock };
   let rateLimiter: { allowConnection: jest.Mock; allowMessage: jest.Mock };
   let gateway: MessagingGateway;
 
@@ -29,7 +29,7 @@ describe('MessagingGateway', () => {
 
   beforeEach(() => {
     authService = { verifyToken: jest.fn() };
-    messages = { send: jest.fn() };
+    messages = { send: jest.fn(), assertParticipant: jest.fn().mockResolvedValue(undefined) };
     rateLimiter = {
       allowConnection: jest.fn().mockReturnValue(true),
       allowMessage: jest.fn().mockReturnValue(true),
@@ -77,12 +77,36 @@ describe('MessagingGateway', () => {
   });
 
   describe('conversation:join / conversation:leave', () => {
-    it('join adds the socket to the conversation room', () => {
+    it('join checks participation, then adds the socket to the conversation room', async () => {
       const client = fakeSocket();
-      const res = gateway.join(client as never, { conversationId: TEST_CONVERSATION_ID });
+      client.data.user = { id: TEST_USERS.alice };
 
+      const res = await gateway.join(client as never, { conversationId: TEST_CONVERSATION_ID });
+
+      expect(messages.assertParticipant).toHaveBeenCalledWith(
+        TEST_CONVERSATION_ID,
+        TEST_USERS.alice,
+      );
       expect(client.join).toHaveBeenCalledWith(`conversation:${TEST_CONVERSATION_ID}`);
       expect(res).toEqual({ event: 'conversation:joined', data: TEST_CONVERSATION_ID });
+    });
+
+    it('join refuses (no room join) when the caller is not a participant', async () => {
+      const client = fakeSocket();
+      client.data.user = { id: TEST_USERS.carol };
+      messages.assertParticipant.mockRejectedValue(new ForbiddenException('not a participant'));
+
+      await expect(
+        gateway.join(client as never, { conversationId: TEST_CONVERSATION_ID }),
+      ).rejects.toBeInstanceOf(ForbiddenException);
+      expect(client.join).not.toHaveBeenCalled();
+    });
+
+    it('join throws WsException when the socket has no attached user', async () => {
+      const client = fakeSocket();
+      await expect(
+        gateway.join(client as never, { conversationId: TEST_CONVERSATION_ID }),
+      ).rejects.toBeInstanceOf(WsException);
     });
 
     it('leave removes the socket from the conversation room', () => {

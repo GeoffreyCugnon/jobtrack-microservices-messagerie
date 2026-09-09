@@ -184,6 +184,17 @@ describe('MessagesService', () => {
       expect(page.items[0].content).toBe('secret');
     });
 
+    it('degrades gracefully (no throw) when a row cannot be decrypted', async () => {
+      cipher.decrypt.mockImplementation(() => {
+        throw new Error('bad key');
+      });
+      prisma.message.findMany.mockResolvedValue([makeMessage({ id: 'm1', content: 'v1:corrupt' })]);
+
+      const page = await service.paginate(TEST_CONVERSATION_ID, TEST_USERS.alice, undefined, 10);
+
+      expect(page.items[0].content).toBe('[contenu indisponible]');
+    });
+
     it('returns nextCursor null on the last page', async () => {
       prisma.message.findMany.mockResolvedValue([
         makeMessage({ id: 'm2' }),
@@ -437,6 +448,27 @@ describe('MessagesService', () => {
         expect.objectContaining({ data: { deletedAt: null } }),
       );
       expect(res.deletedAt).toBeNull();
+    });
+  });
+
+  describe('assertParticipant', () => {
+    it('delegates to ConversationsService.getParticipantConversation', async () => {
+      await service.assertParticipant(TEST_CONVERSATION_ID, TEST_USERS.alice);
+
+      expect(conversations.getParticipantConversation).toHaveBeenCalledWith(
+        TEST_CONVERSATION_ID,
+        TEST_USERS.alice,
+      );
+    });
+
+    it('propagates a ForbiddenException for a non-participant', async () => {
+      conversations.getParticipantConversation.mockRejectedValueOnce(
+        new ForbiddenException('nope'),
+      );
+
+      await expect(
+        service.assertParticipant(TEST_CONVERSATION_ID, TEST_USERS.carol),
+      ).rejects.toBeInstanceOf(ForbiddenException);
     });
   });
 });

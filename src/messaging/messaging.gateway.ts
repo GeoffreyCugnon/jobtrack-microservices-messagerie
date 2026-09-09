@@ -107,10 +107,21 @@ export class MessagingGateway implements OnGatewayConnection {
   // Les handlers @SubscribeMessage sont couverts par le guard global APP_GUARD
   // (AppAuthGuard), qui gère le cas `context.getType() === 'ws'`.
 
-  /** Rejoint la room de la conversation. Réponse : événement `conversation:joined`. */
+  /**
+   * Rejoint la room de la conversation, après avoir vérifié que l'appelant en est
+   * bien participant (les routes REST font ce contrôle partout ; la room WS doit
+   * l'avoir aussi, sinon n'importe quelle socket authentifiée peut écouter le fil
+   * d'autrui). Réponse : événement `conversation:joined`. Erreur mappée en
+   * `WsException` (403 / 404) par `WsExceptionFilter`.
+   */
   @SubscribeMessage('conversation:join')
-  join(@ConnectedSocket() client: Socket, @MessageBody() body: WsConversationDto) {
-    void client.join(room(body.conversationId));
+  async join(@ConnectedSocket() client: Socket, @MessageBody() body: WsConversationDto) {
+    const user = userOf(client);
+    if (!user) {
+      throw new WsException('Unauthorized');
+    }
+    await this.messages.assertParticipant(body.conversationId, user.id);
+    await client.join(room(body.conversationId));
     return { event: 'conversation:joined', data: body.conversationId };
   }
 
