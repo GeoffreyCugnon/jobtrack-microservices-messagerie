@@ -107,6 +107,21 @@ describe('Messaging skeleton (e2e)', () => {
       .expect(400);
   });
 
+  it('guards the new soft-delete / edit routes (401 without a JWT)', async () => {
+    await request(http()).delete('/conversations/11111111-1111-1111-1111-111111111111').expect(401);
+    await request(http()).patch('/messages/11111111-1111-1111-1111-111111111111').expect(401);
+    await request(http())
+      .post('/messages/11111111-1111-1111-1111-111111111111/restore')
+      .expect(401);
+  });
+
+  it('rejects a non-UUID id on GET /messages/:id/versions (400)', () => {
+    return request(http())
+      .get('/messages/not-a-uuid/versions')
+      .set('Authorization', auth())
+      .expect(400);
+  });
+
   it('serves GET /health publicly (no JWT) with a status report', async () => {
     const res = await request(http()).get('/health').expect(200);
 

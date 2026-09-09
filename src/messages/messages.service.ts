@@ -1,20 +1,26 @@
 import { ForbiddenException, Injectable, Logger, NotFoundException } from '@nestjs/common';
 import { EventEmitter2 } from '@nestjs/event-emitter';
 import { assertMessageContent, assertUuid } from '../common/assert';
-import { Message, Prisma } from '../generated/prisma/client';
+import { Message, MessageVersion, Prisma } from '../generated/prisma/client';
 import {
   CONVERSATION_READ,
   MESSAGE_CREATED,
+  MESSAGE_DELETED,
+  MESSAGE_EDITED,
   MESSAGE_READ,
   ConversationReadEvent,
   MessageCreatedEvent,
+  MessageDeletedEvent,
+  MessageEditedEvent,
   MessageReadEvent,
 } from '../common/events';
+import { AuditService } from '../audit/audit.service';
 import { ContentCipherService } from '../common/content-cipher.service';
 import { ConversationsService } from '../conversations/conversations.service';
 import { OutboxService } from '../nats/outbox.service';
 import { NATS_SUBJECTS } from '../nats/nats.events';
 import { PrismaService } from '../prisma/prisma.service';
+import { EditMessageDto } from './dto/edit-message.dto';
 import { SendMessageDto } from './dto/send-message.dto';
 
 /** Taille de page par défaut de la pagination par curseur. */
@@ -27,6 +33,20 @@ export interface MessagePage {
   items: Message[];
   nextCursor: string | null;
 }
+
+/** Version archivée d'un message, contenu déchiffré. */
+export interface MessageVersionView {
+  id: string;
+  content: string;
+  createdAt: Date;
+}
+
+type MessageEvent =
+  | MessageCreatedEvent
+  | MessageReadEvent
+  | ConversationReadEvent
+  | MessageEditedEvent
+  | MessageDeletedEvent;
 
 /**
  * Envoi, lecture et pagination des messages.
@@ -47,6 +67,7 @@ export class MessagesService {
     private readonly events: EventEmitter2,
     private readonly outbox: OutboxService,
     private readonly cipher: ContentCipherService,
+    private readonly audit: AuditService,
   ) {}
 
   /** Renvoie une copie du message avec `content` déchiffré (lecture). */
@@ -59,10 +80,7 @@ export class MessagesService {
    * un listener défaillant ne doit pas transformer une écriture Prisma réussie
    * en réponse REST en erreur.
    */
-  private safeEmit(
-    event: string,
-    payload: MessageCreatedEvent | MessageReadEvent | ConversationReadEvent,
-  ): void {
+  private safeEmit(event: string, payload: MessageEvent): void {
     try {
       this.events.emit(event, payload);
     } catch (err) {
@@ -163,6 +181,14 @@ export class MessagesService {
       message: plain,
     } satisfies MessageCreatedEvent);
 
+    this.audit.log({
+      userId: senderId,
+      action: 'message.sent',
+      resourceType: 'message',
+      resourceId: plain.id,
+      details: { conversationId },
+    });
+
     return plain;
   }
 
@@ -213,6 +239,14 @@ export class MessagesService {
       readBy: userId,
     } satisfies MessageReadEvent);
 
+    this.audit.log({
+      userId,
+      action: 'message.read',
+      resourceType: 'message',
+      resourceId: updated.id,
+      details: { conversationId: updated.conversationId },
+    });
+
     return this.decrypted(updated);
   }
 
@@ -262,6 +296,168 @@ export class MessagesService {
       count,
     } satisfies ConversationReadEvent);
 
+    this.audit.log({
+      userId,
+      action: 'conversation.read',
+      resourceType: 'conversation',
+      resourceId: conversationId,
+      details: { count },
+    });
+
     return { updated: count };
+  }
+
+  /**
+   * Édite le contenu d'un message. Seul l'expéditeur peut éditer. Le contenu
+   * antérieur est archivé dans `MessageVersion` (dans la même transaction),
+   * `editCount` incrémenté, `editedAt` mis à jour. Idempotent : si le nouveau
+   * contenu est identique à l'actuel, aucune version n'est créée.
+   */
+  async edit(messageId: string, userId: string, dto: EditMessageDto): Promise<Message> {
+    assertMessageContent(dto.content);
+    const message = await this.prisma.message.findUnique({ where: { id: messageId } });
+    if (!message || message.deletedAt) {
+      throw new NotFoundException('Message not found');
+    }
+    const conversation = await this.conversations.getParticipantConversation(
+      message.conversationId,
+      userId,
+    );
+    if (message.senderId !== userId) {
+      throw new ForbiddenException('Only the sender can edit this message');
+    }
+    if (this.cipher.decrypt(message.content) === dto.content) {
+      return this.decrypted(message);
+    }
+
+    const updated = await this.prisma.$transaction(async (tx) => {
+      // Archive le contenu ACTUEL tel que stocké (donc déjà chiffré si clé active).
+      await tx.messageVersion.create({
+        data: { messageId, content: message.content },
+      });
+      return tx.message.update({
+        where: { id: messageId },
+        data: {
+          content: this.cipher.encrypt(dto.content),
+          editedAt: new Date(),
+          editCount: { increment: 1 },
+        },
+      });
+    });
+
+    const plain: Message = { ...updated, content: dto.content };
+
+    this.safeEmit(MESSAGE_EDITED, {
+      conversationId: updated.conversationId,
+      participantIds: [conversation.userAId, conversation.userBId],
+      message: plain,
+    } satisfies MessageEditedEvent);
+
+    this.audit.log({
+      userId,
+      action: 'message.edited',
+      resourceType: 'message',
+      resourceId: messageId,
+      details: { conversationId: updated.conversationId, editCount: updated.editCount },
+    });
+
+    return plain;
+  }
+
+  /**
+   * Historique d'édition d'un message (le plus ancien en premier). Accessible
+   * aux deux participants de la conversation.
+   */
+  async getVersions(messageId: string, userId: string): Promise<MessageVersionView[]> {
+    const message = await this.prisma.message.findUnique({ where: { id: messageId } });
+    if (!message || message.deletedAt) {
+      throw new NotFoundException('Message not found');
+    }
+    await this.conversations.getParticipantConversation(message.conversationId, userId);
+
+    const versions = await this.prisma.messageVersion.findMany({
+      where: { messageId },
+      orderBy: { createdAt: 'asc' },
+    });
+    return versions.map((v: MessageVersion) => ({
+      id: v.id,
+      content: this.cipher.decrypt(v.content),
+      createdAt: v.createdAt,
+    }));
+  }
+
+  /**
+   * Soft-delete d'un message. Seul l'expéditeur peut supprimer son message.
+   * Idempotent : un message déjà supprimé renvoie `{ deleted: true }` sans rien
+   * réémettre. Les `MessageVersion` associées suivront le message si celui-ci
+   * est un jour purgé physiquement (cascade en base).
+   */
+  async softDelete(messageId: string, userId: string): Promise<{ deleted: true }> {
+    const message = await this.prisma.message.findUnique({ where: { id: messageId } });
+    if (!message) {
+      throw new NotFoundException('Message not found');
+    }
+    const conversation = await this.conversations.getParticipantConversation(
+      message.conversationId,
+      userId,
+    );
+    if (message.senderId !== userId) {
+      throw new ForbiddenException('Only the sender can delete this message');
+    }
+    if (message.deletedAt) {
+      return { deleted: true };
+    }
+
+    await this.prisma.message.update({
+      where: { id: messageId },
+      data: { deletedAt: new Date() },
+    });
+
+    this.safeEmit(MESSAGE_DELETED, {
+      conversationId: message.conversationId,
+      participantIds: [conversation.userAId, conversation.userBId],
+      messageId,
+      deletedBy: userId,
+    } satisfies MessageDeletedEvent);
+
+    this.audit.log({
+      userId,
+      action: 'message.deleted',
+      resourceType: 'message',
+      resourceId: messageId,
+      details: { conversationId: message.conversationId },
+    });
+
+    return { deleted: true };
+  }
+
+  /** Restaure un message soft-deleté. Expéditeur uniquement. Idempotent. */
+  async restore(messageId: string, userId: string): Promise<Message> {
+    const message = await this.prisma.message.findUnique({ where: { id: messageId } });
+    if (!message) {
+      throw new NotFoundException('Message not found');
+    }
+    await this.conversations.getParticipantConversation(message.conversationId, userId);
+    if (message.senderId !== userId) {
+      throw new ForbiddenException('Only the sender can restore this message');
+    }
+    if (!message.deletedAt) {
+      return this.decrypted(message);
+    }
+
+    const restored = await this.prisma.message.update({
+      where: { id: messageId },
+      data: { deletedAt: null },
+    });
+
+    this.audit.log({
+      userId,
+      action: 'message.restored',
+      resourceType: 'message',
+      resourceId: messageId,
+      details: { conversationId: message.conversationId },
+    });
+
+    return this.decrypted(restored);
   }
 }

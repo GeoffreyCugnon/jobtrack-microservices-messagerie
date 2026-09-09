@@ -1,4 +1,6 @@
 import { ForbiddenException, NotFoundException } from '@nestjs/common';
+import type { AuditService } from '../audit/audit.service';
+import { argOf } from '../common/spec-helpers';
 import { TEST_CONVERSATION_ID, TEST_USERS, makeConversation } from '../common/test-fixtures';
 import { Prisma } from '../generated/prisma/client';
 import type { OutboxService } from '../nats/outbox.service';
@@ -25,6 +27,7 @@ describe('ConversationsService', () => {
     message: { groupBy: jest.Mock };
   };
   let outbox: { enqueueInTx: jest.Mock; wake: jest.Mock };
+  let audit: { log: jest.Mock };
   let service: ConversationsService;
 
   beforeEach(() => {
@@ -40,9 +43,11 @@ describe('ConversationsService', () => {
       message: { groupBy: jest.fn() },
     };
     outbox = { enqueueInTx: jest.fn().mockResolvedValue({ id: 'evt' }), wake: jest.fn() };
+    audit = { log: jest.fn() };
     service = new ConversationsService(
       prisma as unknown as PrismaService,
       outbox as unknown as OutboxService,
+      audit as unknown as AuditService,
     );
   });
 
@@ -214,6 +219,55 @@ describe('ConversationsService', () => {
       await expect(
         service.getParticipantConversation(TEST_CONVERSATION_ID, TEST_USERS.bob),
       ).resolves.toBe(conversation);
+    });
+  });
+
+  describe('softDelete / restore', () => {
+    it('soft-deletes for a participant and audits it', async () => {
+      prisma.conversation.findUnique.mockResolvedValue(makeConversation());
+      prisma.conversation.update.mockResolvedValue(makeConversation({ deletedAt: new Date() }));
+
+      const res = await service.softDelete(TEST_CONVERSATION_ID, TEST_USERS.alice);
+
+      expect(res).toEqual({ deleted: true });
+      const upd = argOf<{ where: unknown; data: { deletedAt: unknown } }>(
+        prisma.conversation.update,
+      );
+      expect(upd.where).toEqual({ id: TEST_CONVERSATION_ID });
+      expect(upd.data.deletedAt).toBeInstanceOf(Date);
+      expect(audit.log).toHaveBeenCalledWith(
+        expect.objectContaining({ action: 'conversation.deleted' }),
+      );
+    });
+
+    it('rejects soft-delete from a non-participant', async () => {
+      prisma.conversation.findUnique.mockResolvedValue(makeConversation());
+
+      await expect(
+        service.softDelete(TEST_CONVERSATION_ID, TEST_USERS.carol),
+      ).rejects.toBeInstanceOf(ForbiddenException);
+    });
+
+    it('restores a soft-deleted conversation for a participant', async () => {
+      prisma.conversation.findUnique.mockResolvedValue(makeConversation({ deletedAt: new Date() }));
+      prisma.conversation.update.mockResolvedValue(makeConversation({ deletedAt: null }));
+
+      const res = await service.restore(TEST_CONVERSATION_ID, TEST_USERS.bob);
+
+      expect(prisma.conversation.update).toHaveBeenCalledWith(
+        expect.objectContaining({ data: { deletedAt: null } }),
+      );
+      expect(res.deletedAt).toBeNull();
+    });
+
+    it('restore is a no-op on an active conversation', async () => {
+      const active = makeConversation({ deletedAt: null });
+      prisma.conversation.findUnique.mockResolvedValue(active);
+
+      const res = await service.restore(TEST_CONVERSATION_ID, TEST_USERS.bob);
+
+      expect(res).toBe(active);
+      expect(prisma.conversation.update).not.toHaveBeenCalled();
     });
   });
 });

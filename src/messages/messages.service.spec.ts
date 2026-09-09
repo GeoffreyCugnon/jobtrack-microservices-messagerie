@@ -6,7 +6,9 @@ import {
   makeConversation,
   makeMessage,
 } from '../common/test-fixtures';
+import type { AuditService } from '../audit/audit.service';
 import type { ContentCipherService } from '../common/content-cipher.service';
+import { argOf } from '../common/spec-helpers';
 import { ConversationsService } from '../conversations/conversations.service';
 import type { OutboxService } from '../nats/outbox.service';
 import { PrismaService } from '../prisma/prisma.service';
@@ -35,12 +37,14 @@ describe('MessagesService', () => {
       update: jest.Mock;
       updateMany: jest.Mock;
     };
+    messageVersion: { create: jest.Mock; findMany: jest.Mock };
     conversation: { update: jest.Mock };
   };
   let conversations: { getParticipantConversation: jest.Mock };
   let events: { emit: jest.Mock };
   let outbox: { enqueueInTx: jest.Mock; wake: jest.Mock };
   let cipher: { encrypt: jest.Mock; decrypt: jest.Mock };
+  let audit: { log: jest.Mock };
   let service: MessagesService;
 
   beforeEach(() => {
@@ -53,6 +57,7 @@ describe('MessagesService', () => {
         update: jest.fn(),
         updateMany: jest.fn().mockResolvedValue({ count: 3 }),
       },
+      messageVersion: { create: jest.fn().mockResolvedValue({}), findMany: jest.fn() },
       conversation: { update: jest.fn().mockResolvedValue({}) },
     };
     conversations = {
@@ -65,12 +70,14 @@ describe('MessagesService', () => {
       encrypt: jest.fn((s: string) => `enc(${s})`),
       decrypt: jest.fn((s: string) => s.replace(/^enc\((.*)\)$/, '$1')),
     };
+    audit = { log: jest.fn() };
     service = new MessagesService(
       prisma as unknown as PrismaService,
       conversations as unknown as ConversationsService,
       events as unknown as EventEmitter2,
       outbox as unknown as OutboxService,
       cipher as unknown as ContentCipherService,
+      audit as unknown as AuditService,
     );
   });
 
@@ -311,6 +318,125 @@ describe('MessagesService', () => {
       expect(result).toEqual({ updated: 0 });
       expect(events.emit).not.toHaveBeenCalled();
       expect(outbox.enqueueInTx).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('edit', () => {
+    it('archives the previous (stored) content, bumps editCount, emits message.edited, returns clear text', async () => {
+      prisma.message.findUnique.mockResolvedValue(
+        makeMessage({ id: 'msg-1', senderId: TEST_USERS.alice, content: 'enc(old)' }),
+      );
+      prisma.message.update.mockResolvedValue(
+        makeMessage({ id: 'msg-1', senderId: TEST_USERS.alice, content: 'enc(new)', editCount: 1 }),
+      );
+
+      const res = await service.edit('msg-1', TEST_USERS.alice, { content: 'new' });
+
+      expect(prisma.messageVersion.create).toHaveBeenCalledWith({
+        data: { messageId: 'msg-1', content: 'enc(old)' },
+      });
+      const upd = argOf<{ data: { content: string; editCount: unknown; editedAt: unknown } }>(
+        prisma.message.update,
+      );
+      expect(upd.data.content).toBe('enc(new)');
+      expect(upd.data.editCount).toEqual({ increment: 1 });
+      expect(upd.data.editedAt).toBeInstanceOf(Date);
+      expect(res.content).toBe('new');
+      expect(events.emit).toHaveBeenCalledWith('message.edited', expect.anything());
+      expect(audit.log).toHaveBeenCalledWith(
+        expect.objectContaining({ action: 'message.edited', resourceId: 'msg-1' }),
+      );
+    });
+
+    it('forbids a non-sender from editing', async () => {
+      prisma.message.findUnique.mockResolvedValue(
+        makeMessage({ id: 'msg-1', senderId: TEST_USERS.alice }),
+      );
+
+      await expect(service.edit('msg-1', TEST_USERS.bob, { content: 'x' })).rejects.toBeInstanceOf(
+        ForbiddenException,
+      );
+      expect(prisma.messageVersion.create).not.toHaveBeenCalled();
+    });
+
+    it('is idempotent when the content is unchanged (no version, no update)', async () => {
+      prisma.message.findUnique.mockResolvedValue(
+        makeMessage({ id: 'msg-1', senderId: TEST_USERS.alice, content: 'enc(same)' }),
+      );
+
+      await service.edit('msg-1', TEST_USERS.alice, { content: 'same' });
+
+      expect(prisma.messageVersion.create).not.toHaveBeenCalled();
+      expect(prisma.message.update).not.toHaveBeenCalled();
+      expect(events.emit).not.toHaveBeenCalled();
+    });
+
+    it('404s on a soft-deleted message', async () => {
+      prisma.message.findUnique.mockResolvedValue(
+        makeMessage({ senderId: TEST_USERS.alice, deletedAt: new Date() }),
+      );
+
+      await expect(
+        service.edit('msg-1', TEST_USERS.alice, { content: 'x' }),
+      ).rejects.toBeInstanceOf(NotFoundException);
+    });
+  });
+
+  describe('getVersions', () => {
+    it('returns the decrypted history oldest-first for a participant', async () => {
+      prisma.message.findUnique.mockResolvedValue(makeMessage({ id: 'msg-1' }));
+      prisma.messageVersion.findMany.mockResolvedValue([
+        { id: 'v1', content: 'enc(first)', createdAt: createdAt },
+        { id: 'v2', content: 'enc(second)', createdAt: createdAt },
+      ]);
+
+      const history = await service.getVersions('msg-1', TEST_USERS.bob);
+
+      expect(prisma.messageVersion.findMany).toHaveBeenCalledWith(
+        expect.objectContaining({ where: { messageId: 'msg-1' }, orderBy: { createdAt: 'asc' } }),
+      );
+      expect(history.map((v) => v.content)).toEqual(['first', 'second']);
+    });
+  });
+
+  describe('softDelete / restore', () => {
+    it('lets the sender soft-delete, emits message.deleted, is idempotent', async () => {
+      prisma.message.findUnique.mockResolvedValue(
+        makeMessage({ id: 'msg-1', senderId: TEST_USERS.alice }),
+      );
+
+      const res = await service.softDelete('msg-1', TEST_USERS.alice);
+
+      expect(res).toEqual({ deleted: true });
+      const upd = argOf<{ data: { deletedAt: unknown } }>(prisma.message.update);
+      expect(upd.data.deletedAt).toBeInstanceOf(Date);
+      expect(events.emit).toHaveBeenCalledWith('message.deleted', expect.anything());
+    });
+
+    it('forbids a non-sender from deleting', async () => {
+      prisma.message.findUnique.mockResolvedValue(
+        makeMessage({ id: 'msg-1', senderId: TEST_USERS.alice }),
+      );
+
+      await expect(service.softDelete('msg-1', TEST_USERS.bob)).rejects.toBeInstanceOf(
+        ForbiddenException,
+      );
+    });
+
+    it('restores a soft-deleted message for its sender', async () => {
+      prisma.message.findUnique.mockResolvedValue(
+        makeMessage({ id: 'msg-1', senderId: TEST_USERS.alice, deletedAt: new Date() }),
+      );
+      prisma.message.update.mockResolvedValue(
+        makeMessage({ id: 'msg-1', senderId: TEST_USERS.alice, deletedAt: null }),
+      );
+
+      const res = await service.restore('msg-1', TEST_USERS.alice);
+
+      expect(prisma.message.update).toHaveBeenCalledWith(
+        expect.objectContaining({ data: { deletedAt: null } }),
+      );
+      expect(res.deletedAt).toBeNull();
     });
   });
 });

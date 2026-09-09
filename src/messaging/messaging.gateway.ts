@@ -18,9 +18,13 @@ import { extractWsToken } from '../auth/extract-token';
 import {
   CONVERSATION_READ,
   MESSAGE_CREATED,
+  MESSAGE_DELETED,
+  MESSAGE_EDITED,
   MESSAGE_READ,
   ConversationReadEvent,
   MessageCreatedEvent,
+  MessageDeletedEvent,
+  MessageEditedEvent,
   MessageReadEvent,
 } from '../common/events';
 import { corsOriginCheck } from '../common/cors';
@@ -149,6 +153,22 @@ export class MessagingGateway implements OnGatewayConnection {
   @OnEvent(MESSAGE_READ)
   broadcastMessageRead(event: MessageReadEvent): void {
     this.server.to(room(event.conversationId)).emit('message:read', event);
+    this.notifyParticipants(event.participantIds, event.conversationId);
+  }
+
+  @OnEvent(MESSAGE_EDITED)
+  broadcastMessageEdited(event: MessageEditedEvent): void {
+    this.server.to(room(event.conversationId)).emit('message:edited', event.message);
+    this.notifyParticipants(event.participantIds, event.conversationId);
+  }
+
+  @OnEvent(MESSAGE_DELETED)
+  broadcastMessageDeleted(event: MessageDeletedEvent): void {
+    this.server.to(room(event.conversationId)).emit('message:deleted', {
+      conversationId: event.conversationId,
+      messageId: event.messageId,
+      deletedBy: event.deletedBy,
+    });
     this.notifyParticipants(event.participantIds, event.conversationId);
   }
 

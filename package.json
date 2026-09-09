@@ -87,6 +87,7 @@
       "**/*.(t|j)s",
       "!**/*.spec.ts",
       "!**/test-fixtures.ts",
+      "!**/spec-helpers.ts",
       "!main.ts",
       "!generated/**"
     ],

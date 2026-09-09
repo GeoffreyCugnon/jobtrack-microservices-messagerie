@@ -1,4 +1,5 @@
 import { ForbiddenException, Injectable, Logger, NotFoundException } from '@nestjs/common';
+import { AuditService } from '../audit/audit.service';
 import { assertUuid } from '../common/assert';
 import { Conversation, Prisma } from '../generated/prisma/client';
 import { OutboxService } from '../nats/outbox.service';
@@ -21,6 +22,7 @@ export class ConversationsService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly outbox: OutboxService,
+    private readonly audit: AuditService,
   ) {}
 
   /** Réveil de l'outbox, blindé : la conversation est déjà committée. */
@@ -95,10 +97,17 @@ export class ConversationsService {
     });
     if (existing) {
       if (existing.deletedAt) {
-        return this.prisma.conversation.update({
+        const revived = await this.prisma.conversation.update({
           where: { id: existing.id },
           data: { deletedAt: null },
         });
+        this.audit.log({
+          userId,
+          action: 'conversation.restored',
+          resourceType: 'conversation',
+          resourceId: revived.id,
+        });
+        return revived;
       }
       return existing;
     }
@@ -128,6 +137,12 @@ export class ConversationsService {
     }
 
     this.safeWake();
+    this.audit.log({
+      userId,
+      action: 'conversation.created',
+      resourceType: 'conversation',
+      resourceId: created.id,
+    });
     return created;
   }
 
@@ -146,5 +161,47 @@ export class ConversationsService {
       throw new ForbiddenException('You are not a participant of this conversation');
     }
     return conversation;
+  }
+
+  /**
+   * Soft-delete d'une conversation (masquée pour les deux participants).
+   * Réservé à un participant. Idempotent. Les messages ne sont pas touchés :
+   * `findOrCreate` réactive la conversation si la paire la rouvre.
+   */
+  async softDelete(id: string, userId: string): Promise<{ deleted: true }> {
+    await this.getParticipantConversation(id, userId); // 404 si déjà supprimée / inconnue, 403 si non participant
+    await this.prisma.conversation.update({ where: { id }, data: { deletedAt: new Date() } });
+    this.audit.log({
+      userId,
+      action: 'conversation.deleted',
+      resourceType: 'conversation',
+      resourceId: id,
+    });
+    return { deleted: true };
+  }
+
+  /** Restaure une conversation soft-deletée. Réservé à un participant. Idempotent. */
+  async restore(id: string, userId: string): Promise<Conversation> {
+    const conversation = await this.prisma.conversation.findUnique({ where: { id } });
+    if (!conversation) {
+      throw new NotFoundException('Conversation not found');
+    }
+    if (conversation.userAId !== userId && conversation.userBId !== userId) {
+      throw new ForbiddenException('You are not a participant of this conversation');
+    }
+    if (!conversation.deletedAt) {
+      return conversation;
+    }
+    const restored = await this.prisma.conversation.update({
+      where: { id },
+      data: { deletedAt: null },
+    });
+    this.audit.log({
+      userId,
+      action: 'conversation.restored',
+      resourceType: 'conversation',
+      resourceId: id,
+    });
+    return restored;
   }
 }

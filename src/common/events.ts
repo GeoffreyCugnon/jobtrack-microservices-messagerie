@@ -13,6 +13,8 @@ import type { Message } from '../generated/prisma/client';
 
 export const MESSAGE_CREATED = 'message.created';
 export const MESSAGE_READ = 'message.read';
+export const MESSAGE_EDITED = 'message.edited';
+export const MESSAGE_DELETED = 'message.deleted';
 export const CONVERSATION_READ = 'conversation.read';
 
 export interface MessageCreatedEvent {
@@ -29,6 +31,21 @@ export interface MessageReadEvent {
   messageId: string;
   readAt: Date;
   readBy: string;
+}
+
+/** Émis après l'édition du contenu d'un message. Contenu en clair. */
+export interface MessageEditedEvent {
+  conversationId: string;
+  participantIds: string[];
+  message: Message;
+}
+
+/** Émis après le soft-delete d'un message. */
+export interface MessageDeletedEvent {
+  conversationId: string;
+  participantIds: string[];
+  messageId: string;
+  deletedBy: string;
 }
 
 /**

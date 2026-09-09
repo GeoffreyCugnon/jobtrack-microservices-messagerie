@@ -1,6 +1,17 @@
-import { Body, Controller, Get, Param, ParseUUIDPipe, Patch, Post, Query } from '@nestjs/common';
+import {
+  Body,
+  Controller,
+  Delete,
+  Get,
+  Param,
+  ParseUUIDPipe,
+  Patch,
+  Post,
+  Query,
+} from '@nestjs/common';
 import { AuthUser } from '../auth/auth-user.interface';
 import { CurrentUser } from '../auth/current-user.decorator';
+import { EditMessageDto } from './dto/edit-message.dto';
 import { ListMessagesQueryDto } from './dto/list-messages-query.dto';
 import { SendMessageDto } from './dto/send-message.dto';
 import { MessagesService } from './messages.service';
@@ -9,7 +20,7 @@ import { MessagesService } from './messages.service';
  * Routes REST des messages.
  *
  * @Controller() sans préfixe : les chemins mêlent `/conversations/:id/messages`
- * et `/messages/:id/read`. ParseUUIDPipe rejette (400) tout id mal formé avant
+ * et `/messages/:id/...`. ParseUUIDPipe rejette (400) tout id mal formé avant
  * d'atteindre la base.
  */
 @Controller()
@@ -55,5 +66,33 @@ export class MessagesController {
     @Param('id', ParseUUIDPipe) conversationId: string,
   ) {
     return this.messages.markConversationRead(conversationId, user.id);
+  }
+
+  /** PATCH /messages/:id — édite le contenu (expéditeur uniquement). */
+  @Patch('messages/:id')
+  edit(
+    @CurrentUser() user: AuthUser,
+    @Param('id', ParseUUIDPipe) id: string,
+    @Body() dto: EditMessageDto,
+  ) {
+    return this.messages.edit(id, user.id, dto);
+  }
+
+  /** GET /messages/:id/versions — historique d'édition (participants). */
+  @Get('messages/:id/versions')
+  versions(@CurrentUser() user: AuthUser, @Param('id', ParseUUIDPipe) id: string) {
+    return this.messages.getVersions(id, user.id);
+  }
+
+  /** DELETE /messages/:id — soft-delete (expéditeur uniquement). */
+  @Delete('messages/:id')
+  remove(@CurrentUser() user: AuthUser, @Param('id', ParseUUIDPipe) id: string) {
+    return this.messages.softDelete(id, user.id);
+  }
+
+  /** POST /messages/:id/restore — restaure un message soft-deleté (expéditeur). */
+  @Post('messages/:id/restore')
+  restore(@CurrentUser() user: AuthUser, @Param('id', ParseUUIDPipe) id: string) {
+    return this.messages.restore(id, user.id);
   }
 }

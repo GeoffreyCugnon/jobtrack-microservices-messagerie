@@ -2,6 +2,7 @@ import { Module } from '@nestjs/common';
 import { ConfigModule } from '@nestjs/config';
 import { APP_GUARD } from '@nestjs/core';
 import { EventEmitterModule } from '@nestjs/event-emitter';
+import { AuditModule } from './audit/audit.module';
 import { AppAuthGuard } from './auth/app-auth.guard';
 import { AuthModule } from './auth/auth.module';
 import { RestRateLimitGuard } from './common/rest-rate-limit.guard';
@@ -25,6 +26,7 @@ import { PrismaModule } from './prisma/prisma.module';
     EventEmitterModule.forRoot(),
     PrismaModule,
     NatsModule,
+    AuditModule,
     AuthModule,
     ConversationsModule,
     MessagesModule,
