@@ -153,6 +153,38 @@ Découverte en cours de route : **NestJS 12 est ESM-only** (tout l'arbre `@nestj
 
 ---
 
+## 0 quinquies. Audit fonctionnel « prod DEMO » + corrections (2026-09-09, sur `develop`)
+
+Audit joué **contre l'instance vivante** (PostgreSQL + NATS réels) : toute la surface REST + WS exercée. `npm test` **109 ✓** · `npm run test:e2e` **9 ✓** · `npm audit` **0**.
+
+### 🔴 Bug corrigé — fuite inter-conversations en WebSocket
+
+`conversation:join` ne vérifiait **aucune appartenance** : une socket authentifiée pouvait rejoindre la room de n'importe quelle conversation (id connu) et recevoir `message:new` / `message:edited` / `message:read` d'autrui. **Reproduit puis corrigé en direct** : `join` appelle `MessagesService.assertParticipant()` (→ `getParticipantConversation`, `NotFound`/`Forbidden` mappées en `WsException`) avant `client.join`. Vérifié : participant OK, étranger → 403, ne reçoit rien.
+
+### Autres corrections
+
+- **Déchiffrement tolérant** : si une ligne est illisible (clé absente/rotée, corruption), les lectures renvoient `[contenu indisponible]` + log au lieu d'un 500 sur toute la page (`paginate` / `markRead` / check d'idempotence `edit` / `getVersions`).
+- **`content` trimé** avant validation (`SendMessageDto` / `WsSendMessageDto` / `EditMessageDto`, `@Transform`) — `"  hi  "` → `"hi"`, `"   "` → rejeté. Spec dédiée.
+- **`POST .../restore` → 200** (au lieu du 201 par défaut Nest) pour conversations et messages.
+- **`GET /conversations/:id`** (avec `unreadCount`) et **`GET /messages/:id`** (déchiffré) — lectures unitaires participants-only.
+- **Warn au démarrage** si `MESSAGING_CORS_ORIGINS` non défini.
+- **`docker-compose`** : `MESSAGING_TRUST_PROXY` défaut `1` (un hop, cas courant) au lieu de `false`.
+- **`.env.example`** : `MESSAGING_OUTBOX_DRAIN_MS` documenté.
+
+### Outillage démo
+
+- `scripts/mint-token.ts` (`npm run token [-- <uuid>]`) — mint un JWT HS256 accepté par le service (le service n'en émet pas).
+- `scripts/seed-demo.ts` (`npm run seed:demo`) — amorce une conversation Alice↔Bob (6 messages, 1 non lu pour Bob) en base + affiche les 2 tokens. Idempotent, sans WS/NATS.
+
+### Reste ouvert pour un vrai déploiement demo
+
+- **Image Docker jamais `docker build`-ée** ici — faire un `docker compose up --build` réel avant la demo.
+- `MESSAGING_CONTENT_ENCRYPTION_KEY` : si activée, la **figer** (un redémarrage sans elle rend les `v1:` illisibles → `[contenu indisponible]`, plus 500 depuis cette passe mais fil dégradé).
+- Pas de `presence` / `typing` (hors périmètre).
+- `AuditLog` / `OutboxEvent` sans purge (négligeable au volume demo).
+
+---
+
 ## 1. Architecture générale
 
 ### 1.1 Modèle de déploiement

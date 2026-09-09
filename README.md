@@ -39,22 +39,36 @@ Si NATS est injoignable au démarrage, le service **démarre quand même** : `Na
 
 En production : `npm run build && npm run prisma:migrate && npm run start:prod`. Ou via Docker : voir *Déploiement Docker* plus bas.
 
+Si `MESSAGING_CORS_ORIGINS` n'est pas défini, le service **log un `warn` au démarrage** et retombe sur les origines de dev Vite — à définir pour toute instance déployée (sinon les appels navigateur, HTTP et WebSocket, sont bloqués).
+
+### Démo / test manuel
+
+```bash
+npm run token                  # mint un JWT (sub = UUID aléatoire, 24h) + exemples curl/WS
+npm run token -- <uuid>        # ... pour un sub imposé
+npm run seed:demo              # amorce une conversation Alice↔Bob (6 messages, 1 non lu) + affiche leurs 2 tokens
+```
+
+`seed:demo` écrit directement en base (idempotent, ne déclenche ni WS ni NATS) : lancer l'app **après** pour voir le fil. Le service n'émet aucun token lui-même — `npm run token` reproduit exactement la signature attendue (`src/auth/auth.service.ts`).
+
 ## Endpoints REST
 
 | Méthode | Route | Description |
 |---|---|---|
 | `GET` | `/conversations` | Page de conversations de l'appelant (**curseur** : `?cursor=<id>&limit=<1..100>`, défaut 30), triées par `lastMessageAt` |
+| `GET` | `/conversations/:id` | Une conversation de l'appelant, avec son `unreadCount` (participant ; 404 si supprimée) |
 | `POST` | `/conversations` | Ouvre (ou récupère) la conversation avec `{ "participantId": "..." }` — réactive une conversation supprimée |
 | `DELETE` | `/conversations/:id` | Soft-delete (masque la conversation pour les deux participants ; idempotent) |
-| `POST` | `/conversations/:id/restore` | Restaure une conversation soft-deletée |
+| `POST` | `/conversations/:id/restore` | Restaure une conversation soft-deletée (**200**) |
 | `GET` | `/conversations/:id/messages` | Messages paginés **par curseur** (`?cursor=<messageId>&limit=<1..100>`, borné aussi côté service) |
-| `POST` | `/conversations/:id/messages` | Envoi d'un message — **fallback REST** si le WebSocket est indisponible |
+| `POST` | `/conversations/:id/messages` | Envoi d'un message — **fallback REST** si le WebSocket est indisponible (`content` est trimé) |
+| `GET` | `/messages/:id` | Un message par id (participants ; 404 si supprimé) |
 | `PATCH` | `/messages/:id/read` | Marque **un** message comme lu (interdit à l'expéditeur ; idempotent) |
 | `PATCH` | `/conversations/:id/messages/read` | Marque **tous** les messages reçus non lus de la conversation comme lus |
 | `PATCH` | `/messages/:id` | Édite le contenu (**expéditeur uniquement** ; archive la version précédente ; idempotent si inchangé) |
 | `GET` | `/messages/:id/versions` | Historique d'édition (`{ id, content, createdAt }[]`, plus ancien d'abord ; participants) |
 | `DELETE` | `/messages/:id` | Soft-delete d'un message (**expéditeur uniquement** ; idempotent) |
-| `POST` | `/messages/:id/restore` | Restaure un message soft-deleté (expéditeur) |
+| `POST` | `/messages/:id/restore` | Restaure un message soft-deleté (expéditeur ; **200**) |
 | `GET` | `/health` | Sonde **publique** (sans JWT, hors rate limiting) : `{ status, database, nats, outboxPending }` — **HTTP 503** si `database` est `down` |
 
 Pagination (`GET /conversations` et `GET /conversations/:id/messages`) : la réponse est `{ "items": [...], "nextCursor": "<id|null>" }`. Repasser `nextCursor` dans `?cursor=` pour la page suivante. Les messages sont renvoyés du **plus récent au plus ancien** ; les conversations, les plus récemment actives d'abord.
@@ -152,6 +166,8 @@ src/
                  validateurs (assert, @MaxJsonSize), helpers de test
 scripts/
   smoke-test.ts  test manuel end-to-end sur infra réelle (npm run smoke-test)
+  mint-token.ts  génère un JWT accepté par le service (npm run token)
+  seed-demo.ts   amorce une conversation de démo en base (npm run seed:demo)
 ```
 
 ## Tests

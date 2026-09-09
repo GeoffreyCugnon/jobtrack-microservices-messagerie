@@ -20,6 +20,8 @@
     "test:watch": "jest --watch",
     "test:e2e": "jest --config ./test/jest-e2e.json",
     "smoke-test": "tsx scripts/smoke-test.ts",
+    "token": "tsx scripts/mint-token.ts",
+    "seed:demo": "tsx scripts/seed-demo.ts",
     "postinstall": "prisma generate"
   },
   "dependencies": {
