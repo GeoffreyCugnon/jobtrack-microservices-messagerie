@@ -1,4 +1,4 @@
-import { Logger, UsePipes, ValidationPipe } from '@nestjs/common';
+import { Logger, UseFilters, UsePipes, ValidationPipe } from '@nestjs/common';
 import { OnEvent } from '@nestjs/event-emitter';
 import {
   ConnectedSocket,
@@ -10,6 +10,8 @@ import {
   WsException,
 } from '@nestjs/websockets';
 import { Server, Socket } from 'socket.io';
+import { clientIpFromHandshake } from '../common/trust-proxy';
+import { WsExceptionFilter } from './ws-exception.filter';
 import { AuthUser } from '../auth/auth-user.interface';
 import { AuthService } from '../auth/auth.service';
 import { extractWsToken } from '../auth/extract-token';
@@ -40,9 +42,12 @@ const userRoom = (userId: string): string => `user:${userId}`;
 /** Utilisateur attaché au socket par handleConnection / AppAuthGuard. */
 const userOf = (client: Socket): AuthUser | undefined => (client.data as { user?: AuthUser }).user;
 
-/** IP du client à l'origine du handshake (fallback si absente). */
-const ipOf = (client: Socket): string =>
-  (client.handshake as { address?: string }).address ?? 'unknown';
+/**
+ * IP du client à l'origine du handshake. Derrière un reverse proxy, prend la
+ * première entrée de `X-Forwarded-For` (cf. src/common/trust-proxy.ts) plutôt que
+ * l'IP du proxy — sinon toutes les connexions partagent un seul bucket.
+ */
+const ipOf = (client: Socket): string => clientIpFromHandshake(client.handshake);
 
 /**
  * Gateway temps réel (Socket.IO).
@@ -55,7 +60,8 @@ const ipOf = (client: Socket): string =>
  * CORS Socket.IO : même liste blanche que le CORS HTTP (`corsOriginCheck`,
  * pilotée par `MESSAGING_CORS_ORIGINS`).
  */
-@UsePipes(new ValidationPipe({ whitelist: true, transform: true }))
+@UseFilters(new WsExceptionFilter())
+@UsePipes(new ValidationPipe({ whitelist: true, transform: true, forbidNonWhitelisted: true }))
 @WebSocketGateway({ cors: { origin: corsOriginCheck } })
 export class MessagingGateway implements OnGatewayConnection {
   private readonly logger = new Logger(MessagingGateway.name);

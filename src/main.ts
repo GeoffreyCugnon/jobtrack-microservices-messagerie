@@ -1,7 +1,9 @@
 import { Logger, ValidationPipe } from '@nestjs/common';
 import { NestFactory } from '@nestjs/core';
+import type { NestExpressApplication } from '@nestjs/platform-express';
 import { AppModule } from './app.module';
 import { allowedOrigins, corsOriginCheck } from './common/cors';
+import { trustProxySetting } from './common/trust-proxy';
 
 /**
  * Point d'entrée du micro-service.
@@ -11,7 +13,13 @@ import { allowedOrigins, corsOriginCheck } from './common/cors';
  *   - la gateway WebSocket Socket.IO (montée automatiquement via MessagingModule).
  */
 async function bootstrap(): Promise<void> {
-  const app = await NestFactory.create(AppModule);
+  const app = await NestFactory.create<NestExpressApplication>(AppModule);
+
+  // Derrière un reverse proxy (nginx / traefik / ingress), Express doit dériver
+  // `req.ip` du header `X-Forwarded-For` — sinon tout le trafic partage l'IP du
+  // proxy et le rate limiting REST devient un bucket global. Piloté par
+  // `MESSAGING_TRUST_PROXY` (défaut : 1 hop). Cf. src/common/trust-proxy.ts.
+  app.set('trust proxy', trustProxySetting());
 
   // CORS HTTP : le projet hôte (JobTrack) appelle ce service directement depuis
   // le navigateur (header Authorization, pas de cookie), donc pas besoin de
@@ -40,6 +48,7 @@ async function bootstrap(): Promise<void> {
   const logger = new Logger('Bootstrap');
   logger.log(`Messaging service listening on port ${port}`);
   logger.log(`CORS allowed origins: ${allowedOrigins().join(', ')}`);
+  logger.log(`trust proxy: ${String(trustProxySetting())}`);
 }
 
 void bootstrap();

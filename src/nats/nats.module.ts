@@ -17,7 +17,7 @@ import { OutboxService } from './outbox.service';
 @Global()
 @Module({
   providers: [natsConnectionProvider, OutboxService, NatsPublisherService],
-  // NATS_CONNECTION est exporté pour le healthcheck (GET /health).
-  exports: [NatsPublisherService, NATS_CONNECTION],
+  // NATS_CONNECTION et OutboxService sont exportés pour le healthcheck (GET /health).
+  exports: [NatsPublisherService, OutboxService, NATS_CONNECTION],
 })
 export class NatsModule {}

@@ -2,11 +2,9 @@ import { Module } from '@nestjs/common';
 import { ConfigModule } from '@nestjs/config';
 import { APP_GUARD } from '@nestjs/core';
 import { EventEmitterModule } from '@nestjs/event-emitter';
-import { ThrottlerModule } from '@nestjs/throttler';
 import { AppAuthGuard } from './auth/app-auth.guard';
 import { AuthModule } from './auth/auth.module';
-import { REST_THROTTLE } from './common/rate-limit.constants';
-import { RestThrottlerGuard } from './common/rest-throttler.guard';
+import { RestRateLimitGuard } from './common/rest-rate-limit.guard';
 import { ConversationsModule } from './conversations/conversations.module';
 import { HealthModule } from './health/health.module';
 import { MessagesModule } from './messages/messages.module';
@@ -25,10 +23,6 @@ import { PrismaModule } from './prisma/prisma.module';
     // Bus d'événements *interne au process* : MessagesService -> MessagingGateway
     // (diffusion WebSocket). Sans rapport avec NATS, qui est inter-services.
     EventEmitterModule.forRoot(),
-    // Rate limiting REST (par IP). Stockage en mémoire process : suffisant pour
-    // le modèle « une instance isolée par projet hôte ». `ttl` en millisecondes
-    // (throttler v6). Voir src/common/rate-limit.constants.ts pour les valeurs.
-    ThrottlerModule.forRoot([{ ttl: REST_THROTTLE.ttlMs, limit: REST_THROTTLE.limit }]),
     PrismaModule,
     NatsModule,
     AuthModule,
@@ -41,7 +35,7 @@ import { PrismaModule } from './prisma/prisma.module';
     // Rate limiting REST en premier : un flood est rejeté (429) avant même la
     // vérification JWT. No-op hors contexte HTTP (le WS a son propre throttling
     // dans MessagingGateway).
-    { provide: APP_GUARD, useClass: RestThrottlerGuard },
+    { provide: APP_GUARD, useClass: RestRateLimitGuard },
     // Guard commun appliqué à TOUTES les routes REST et aux handlers
     // @SubscribeMessage de la gateway. La connexion WebSocket elle-même est
     // authentifiée séparément dans MessagingGateway#handleConnection (les guards

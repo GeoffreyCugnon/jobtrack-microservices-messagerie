@@ -1,4 +1,12 @@
-import { IsObject, IsOptional, IsString, IsUUID, MaxLength, MinLength } from 'class-validator';
+import {
+  IsObject,
+  IsOptional,
+  IsString,
+  IsUUID,
+  Matches,
+  MaxLength,
+  MinLength,
+} from 'class-validator';
 import { MaxJsonSize } from '../../common/max-json-size.validator';
 
 /**
@@ -21,6 +29,7 @@ export class WsSendMessageDto {
   @IsString()
   @MinLength(1)
   @MaxLength(5000)
+  @Matches(/\S/, { message: 'content must not be blank' })
   content!: string;
 
   @IsOptional()
