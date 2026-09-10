@@ -135,6 +135,17 @@ describe('Messaging skeleton (e2e)', () => {
     expect(prismaMock.outboxEvent.count).toHaveBeenCalled();
   });
 
+  it('exposes GET /metrics publicly in Prometheus format', async () => {
+    const res = await request(http()).get('/metrics').expect(200);
+    expect(res.text).toContain('http_requests_total');
+    expect(res.text).toContain('process_cpu_user_seconds_total');
+  });
+
+  it('echoes a correlation id on every response (x-request-id)', async () => {
+    const res = await request(http()).get('/health').expect(200);
+    expect(res.headers['x-request-id']).toBeDefined();
+  });
+
   it('returns 429 Too Many Requests once the REST throttle limit is exceeded', async () => {
     const statuses: number[] = [];
     // Largement au-dessus de la limite (20) même en tenant compte des requêtes

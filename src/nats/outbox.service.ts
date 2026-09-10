@@ -96,21 +96,47 @@ export class OutboxService implements OnModuleInit, OnModuleDestroy {
         return;
       }
 
+      const js = this.nats.jetstream();
       const sent: string[] = [];
-      for (const evt of batch) {
-        try {
-          conn.publish(evt.subject, this.codec.encode(evt.payload));
-          sent.push(evt.id);
-        } catch (err) {
-          await this.reschedule(evt, err);
+
+      if (js) {
+        // JetStream : chaque `publish()` attend l'ACK serveur (persistance dans
+        // le stream confirmée). Pas de flush séparé.
+        for (const evt of batch) {
+          try {
+            await js.publish(evt.subject, this.codec.encode(evt.payload));
+            sent.push(evt.id);
+          } catch (err) {
+            await this.reschedule(evt, err);
+          }
+        }
+      } else {
+        // Core NATS : `publish()` est fire-and-forget ; un `flush()` global
+        // attend l'ack serveur et fait remonter une erreur AVANT le marquage.
+        for (const evt of batch) {
+          try {
+            conn.publish(evt.subject, this.codec.encode(evt.payload));
+            sent.push(evt.id);
+          } catch (err) {
+            await this.reschedule(evt, err);
+          }
+        }
+        if (sent.length > 0) {
+          try {
+            await conn.flush();
+          } catch (err) {
+            for (const evt of batch) {
+              if (sent.includes(evt.id)) {
+                await this.reschedule(evt, err);
+              }
+            }
+            sent.length = 0;
+          }
         }
       }
 
       if (sent.length > 0) {
         try {
-          // `publish()` est fire-and-forget : `flush()` attend l'ack serveur et
-          // fait remonter une éventuelle erreur AVANT qu'on marque publié.
-          await conn.flush();
           await this.prisma.outboxEvent.updateMany({
             where: { id: { in: sent } },
             data: { publishedAt: new Date(), lastError: null },

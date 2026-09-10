@@ -36,7 +36,7 @@ describe('OutboxService', () => {
     };
   };
   let conn: { publish: jest.Mock; flush: jest.Mock };
-  let manager: { connection: NatsConnection | null };
+  let manager: { connection: NatsConnection | null; jetstream: jest.Mock };
   let outbox: OutboxService;
 
   beforeEach(() => {
@@ -49,7 +49,11 @@ describe('OutboxService', () => {
       },
     };
     conn = { publish: jest.fn(), flush: jest.fn().mockResolvedValue(undefined) };
-    manager = { connection: conn as unknown as NatsConnection };
+    // Par défaut : JetStream désactivé → chemin core NATS (publish + flush).
+    manager = {
+      connection: conn as unknown as NatsConnection,
+      jetstream: jest.fn().mockReturnValue(null),
+    };
     outbox = new OutboxService(
       prisma as unknown as PrismaService,
       manager as unknown as NatsConnectionManager,
@@ -129,6 +133,41 @@ describe('OutboxService', () => {
 
     expect(prisma.outboxEvent.updateMany).not.toHaveBeenCalled();
     expect(prisma.outboxEvent.update).toHaveBeenCalledTimes(2);
+  });
+
+  describe('JetStream mode', () => {
+    it('publishes each row via js.publish (awaiting the ACK) and marks them, no flush', async () => {
+      const js = { publish: jest.fn().mockResolvedValue({ seq: 1 }) };
+      manager.jetstream.mockReturnValue(js);
+      prisma.outboxEvent.findMany.mockResolvedValue([row({ id: 'a' }), row({ id: 'b' })]);
+
+      await outbox.drain();
+
+      expect(js.publish).toHaveBeenCalledTimes(2);
+      expect(conn.publish).not.toHaveBeenCalled();
+      expect(conn.flush).not.toHaveBeenCalled();
+      const args = firstArg<{ where: unknown }>(prisma.outboxEvent.updateMany);
+      expect(args.where).toEqual({ id: { in: ['a', 'b'] } });
+    });
+
+    it('reschedules only the row whose js.publish rejected', async () => {
+      const js = {
+        publish: jest
+          .fn()
+          .mockResolvedValueOnce({ seq: 1 })
+          .mockRejectedValueOnce(new Error('no stream')),
+      };
+      manager.jetstream.mockReturnValue(js);
+      prisma.outboxEvent.findMany.mockResolvedValue([row({ id: 'a' }), row({ id: 'b' })]);
+
+      await outbox.drain();
+
+      expect(prisma.outboxEvent.update).toHaveBeenCalledTimes(1);
+      const args = firstArg<{ where: { id: string } }>(prisma.outboxEvent.update);
+      expect(args.where).toEqual({ id: 'b' });
+      const marked = firstArg<{ where: { id: { in: string[] } } }>(prisma.outboxEvent.updateMany);
+      expect(marked.where).toEqual({ id: { in: ['a'] } });
+    });
   });
 
   it('wake() never throws to the caller', () => {

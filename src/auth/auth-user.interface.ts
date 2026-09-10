@@ -6,6 +6,13 @@
  */
 export interface AuthUser {
   id: string;
+  /**
+   * Rôles portés par le claim `roles` du JWT, si l'hôte en fournit. `undefined`
+   * ou `[]` quand le claim est absent — c'est le cas aujourd'hui (l'hôte JobTrack
+   * n'émet pas ce claim). Lu uniquement par `RolesGuard` sur les handlers
+   * décorés `@Roles(...)`.
+   */
+  roles?: string[];
 }
 
 /**

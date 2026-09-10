@@ -180,8 +180,42 @@ Audit joué **contre l'instance vivante** (PostgreSQL + NATS réels) : toute la 
 
 - **Image Docker jamais `docker build`-ée** ici — faire un `docker compose up --build` réel avant la demo.
 - `MESSAGING_CONTENT_ENCRYPTION_KEY` : si activée, la **figer** (un redémarrage sans elle rend les `v1:` illisibles → `[contenu indisponible]`, plus 500 depuis cette passe mais fil dégradé).
-- Pas de `presence` / `typing` (hors périmètre).
-- `AuditLog` / `OutboxEvent` sans purge (négligeable au volume demo).
+
+---
+
+## 0 sexies. Durcissement « backlog » + typing (2026-09-10, sur `develop`)
+
+`npm run typecheck` ✓ · `npm run lint:ci` ✓ · `npm run build` ✓ · `npm test` **134 ✓** · `npm run test:e2e` **11 ✓**.
+
+Application de tout le backlog encore ouvert des §0 quater / quinquies (**sauf** l'image Docker, à `docker build` plus tard) + l'indicateur « en train d'écrire ».
+
+| # | Item | Réalisation |
+|---|------|-------------|
+| **CI** | Aucun workflow | `.github/workflows/ci.yml` (`lint:ci` → `typecheck` → `build` → `test` → `test:e2e`). Aucune infra : Prisma/NATS mockés. Script `lint:ci` (`eslint --max-warnings 0`, sans `--fix`). |
+| **JWT maxAge** | Mécanisme présent mais off | `MESSAGING_JWT_MAX_AGE` **par défaut `24h`** (`off` pour désactiver). `auth.module.ts`. |
+| **helmet** | Absent | `app.use(helmet({ contentSecurityPolicy: false, crossOriginResourcePolicy: 'cross-origin' }))` dans `main.ts`. |
+| **Logs structurés + request-id** | `Logger` Nest par défaut | `nestjs-pino` (`src/observability/logger.options.ts`) : JSON une ligne, niveau `MESSAGING_LOG_LEVEL`, `pino-pretty` hors prod/test, `x-request-id` propagé (header entrant réutilisé sinon `randomUUID`) et renvoyé. `/health` + `/metrics` non journalisés. `authorization`/`cookie` masqués. `bufferLogs` + `app.useLogger`. |
+| **Filtre d'exceptions global** | Aucun (hors `WsExceptionFilter` gateway) | `AllExceptionsFilter` (`APP_FILTER`, HTTP only) : corps d'erreur uniforme `{ statusCode, error, message, timestamp, path, requestId }`, 5xx en `error` (stack), 4xx en `warn`. Ne touche pas le WS. |
+| **Métriques Prometheus** | Absentes | `GET /metrics` (`@Public()` + `@SkipRateLimit()`, `MetricsController`). `MetricsService` : `collectDefaultMetrics` + `http_requests_total` / `http_request_duration_seconds` (via `MetricsInterceptor`, mesuré sur `res` `finish`), `ws_connections_active` / `ws_messages_sent_total` (gateway), `outbox_pending_events` (jauge pull → `OutboxService.countPending()`). Pas de label `service` (c'est le job Prometheus). |
+| **OpenAPI** | Absent | `@nestjs/swagger` (v11, compat NestJS 11) : `/docs`, `addBearerAuth()`, plugin CLI (`nest-cli.json`, `introspectComments`). Désactivable via `MESSAGING_ENABLE_DOCS=false`. |
+| **Purge de rétention** | `AuditLog` / `OutboxEvent` sans purge | `@nestjs/schedule` + `RetentionService` (`@Cron` 03:00) : `AuditLog` et `OutboxEvent` **publiés** > `MESSAGING_RETENTION_DAYS` (90), `OutboxEvent` **failed** > `MESSAGING_RETENTION_FAILED_DAYS` (180). `MESSAGING_RETENTION_ENABLED=false` pour couper. Best-effort. |
+| **Rate limiting Redis (optionnel)** | Mémoire process uniquement | `src/common/rate-limiter/` : interface `RateLimiter` (async), `MemoryRateLimiter` (fenêtre glissante, comportement historique), `RedisRateLimiter` (fenêtre fixe `INCR`+`PEXPIRE`, `ioredis`), `RateLimiterFactory` (choix selon `MESSAGING_REDIS_URL`, connexion unique fermée au shutdown). `RestRateLimitGuard` + `WsRateLimiterService` passent en `async`. |
+| **NATS JetStream** | Core NATS fire-and-forget | `MESSAGING_NATS_JETSTREAM=true` → `NatsConnectionManager` crée/aligne un stream (`MESSAGING_NATS_STREAM_NAME`, défaut `MESSAGING`, sujets `messaging.>`, `max_age` optionnel) à la connexion (best-effort) et expose `jetstream()`. `OutboxService.drain()` publie alors via `js.publish()` (attend l'ACK, pas de `flush`) ; repli core sinon. Consommateurs inchangés (mêmes sujets). |
+| **RolesGuard** | Absent | `@Roles(...)` + `RolesGuard` (`APP_GUARD` après `AppAuthGuard`). Lit le claim `roles` du JWT (`AuthUser.roles?`, extrait par `verifyToken`, ignoré si malformé). **No-op tant qu'aucun handler n'est décoré `@Roles()`** — l'hôte JobTrack n'émet pas encore ce claim. |
+| **`typing:start` / `typing:stop`** | — | Gateway : contrôle de participation (`assertParticipant`, comme `join`) + rate limit dédié (`WS_TYPING_THROTTLE`, 20/10 s/user, refus silencieux), puis relais d'un événement `typing` `{ conversationId, userId, typing }` aux **autres** sockets de la room. Rien n'est persisté. `handleDisconnect` ajouté (jauge WS). |
+
+Tests ajoutés : `auth.service.spec.ts` (extraction `roles`), `auth/roles.guard.spec.ts`, `common/rate-limiter/rate-limiter.spec.ts`, `metrics/metrics.service.spec.ts`, `retention/retention.service.spec.ts` ; `messaging.gateway.spec.ts` et `rate-limiter.service.spec.ts` adaptés (async + `MetricsService` + typing) ; `outbox.service.spec.ts` (chemin JetStream) ; e2e (`GET /metrics`, header `x-request-id`).
+
+Nouvelles deps : `helmet`, `nestjs-pino` + `pino` + `pino-http`, `prom-client`, `@nestjs/swagger@^11`, `@nestjs/schedule@^5`, `ioredis` ; dev : `pino-pretty`, `@types/express`.
+
+### Reste ouvert
+
+- **Image Docker** : toujours pas `docker build`-ée (demandé : plus tard).
+- `MESSAGING_CONTENT_ENCRYPTION_KEY` : à figer si activée (inchangé).
+- `RedisRateLimiter` : fenêtre **fixe** (vs glissante en mémoire) — rafale possible à cheval sur deux fenêtres, acceptable pour de l'anti-flood.
+- `RolesGuard` inactif tant que l'hôte JobTrack n'ajoute pas `roles` au JWT de messagerie (à coordonner avec l'item `RolesGuard CEO/recruteur` côté Backend).
+- Pas de `presence` (seul `typing` est fait).
+- Sentry / error tracking : non retenu.
 
 ---
 

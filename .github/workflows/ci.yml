@@ -1,0 +1,43 @@
+name: CI
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    env:
+      # Le lint / typecheck / build / tests ne touchent aucune infra :
+      # Prisma et NATS sont mockés dans les specs et l'e2e (cf. test/).
+      # Ces valeurs servent seulement à satisfaire ConfigModule au boot.
+      MESSAGING_JWT_SECRET: ci-secret
+      MESSAGING_DATABASE_URL: postgresql://ci:ci@localhost:5432/ci?schema=public
+      MESSAGING_NATS_URL: nats://localhost:4222
+      NODE_ENV: test
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      # `npm ci` déclenche `postinstall: prisma generate` (schéma seul, pas de DB).
+      - run: npm ci
+
+      # `npm run lint` a `--fix` (dev) ; `lint:ci` échoue au lieu de corriger.
+      - run: npm run lint:ci
+
+      - run: npm run typecheck
+
+      - run: npm run build
+
+      - run: npm test -- --ci --coverage
+
+      - run: npm run test:e2e -- --ci

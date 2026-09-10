@@ -1,6 +1,9 @@
-import { Logger, ValidationPipe } from '@nestjs/common';
+import { ValidationPipe } from '@nestjs/common';
 import { NestFactory } from '@nestjs/core';
 import type { NestExpressApplication } from '@nestjs/platform-express';
+import { DocumentBuilder, SwaggerModule } from '@nestjs/swagger';
+import helmet from 'helmet';
+import { Logger } from 'nestjs-pino';
 import { AppModule } from './app.module';
 import { allowedOrigins, corsOriginCheck } from './common/cors';
 import { trustProxySetting } from './common/trust-proxy';
@@ -13,7 +16,20 @@ import { trustProxySetting } from './common/trust-proxy';
  *   - la gateway WebSocket Socket.IO (montée automatiquement via MessagingModule).
  */
 async function bootstrap(): Promise<void> {
-  const app = await NestFactory.create<NestExpressApplication>(AppModule);
+  // `bufferLogs` : les logs du démarrage sont mis en tampon puis rejoués une
+  // fois le logger pino (nestjs-pino) résolu, pour tout avoir au même format.
+  const app = await NestFactory.create<NestExpressApplication>(AppModule, { bufferLogs: true });
+  app.useLogger(app.get(Logger));
+
+  // En-têtes de sécurité HTTP. CSP désactivée (API JSON + Swagger UI, pas de
+  // page applicative servie) ; CORP `cross-origin` car l'API est consommée
+  // depuis le navigateur par un front d'une autre origine.
+  app.use(
+    helmet({
+      contentSecurityPolicy: false,
+      crossOriginResourcePolicy: { policy: 'cross-origin' },
+    }),
+  );
 
   // Derrière un reverse proxy (nginx / traefik / ingress), Express doit dériver
   // `req.ip` du header `X-Forwarded-For` — sinon tout le trafic partage l'IP du
@@ -37,6 +53,23 @@ async function bootstrap(): Promise<void> {
     new ValidationPipe({ whitelist: true, transform: true, forbidNonWhitelisted: true }),
   );
 
+  // Documentation OpenAPI interactive sur `/docs`. Désactivable en prod via
+  // `MESSAGING_ENABLE_DOCS=false`.
+  if ((process.env.MESSAGING_ENABLE_DOCS ?? 'true').trim().toLowerCase() !== 'false') {
+    const swaggerConfig = new DocumentBuilder()
+      .setTitle('MS-Messagerie')
+      .setDescription(
+        'API REST du micro-service de messagerie one-to-one. ' +
+          "Auth : JWT HS256 (claim `sub`) émis par l'hôte, en header `Authorization: Bearer`. " +
+          'Le temps réel passe par Socket.IO (événements `message:*`, `typing`, `conversation:*`).',
+      )
+      .setVersion(process.env.npm_package_version ?? '0.1.0')
+      .addBearerAuth()
+      .build();
+    const document = SwaggerModule.createDocument(app, swaggerConfig);
+    SwaggerModule.setup('docs', app, document, { customSiteTitle: 'MS-Messagerie API' });
+  }
+
   // Propage les signaux d'arrêt (SIGINT/SIGTERM) vers les hooks onModuleDestroy
   // (déconnexion Prisma, drain de la connexion NATS…).
   app.enableShutdownHooks();
@@ -45,7 +78,8 @@ async function bootstrap(): Promise<void> {
   // d'autres services de dev qui écoutent souvent sur 3000.
   const port = process.env.PORT ? Number(process.env.PORT) : 3100;
   await app.listen(port);
-  const logger = new Logger('Bootstrap');
+
+  const logger = app.get(Logger);
   logger.log(`Messaging service listening on port ${port}`);
   logger.log(`CORS allowed origins: ${allowedOrigins().join(', ')}`);
   logger.log(`trust proxy: ${String(trustProxySetting())}`);

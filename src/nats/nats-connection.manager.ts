@@ -1,10 +1,16 @@
 import { Injectable, Logger, OnModuleDestroy, OnModuleInit } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import { connect, NatsConnection } from 'nats';
+import { connect, JetStreamClient, NatsConnection, RetentionPolicy } from 'nats';
 import { DEFAULT_NATS_URL } from './nats.constants';
 
 /** Intervalle de re-tentative quand NATS était injoignable au démarrage. */
 const RECONNECT_PROBE_MS = 10_000;
+
+/** Entier > 0 depuis l'env, sinon `undefined`. */
+function optionalPositiveInt(raw: string | undefined): number | undefined {
+  const n = Number(raw);
+  return Number.isFinite(n) && n > 0 ? Math.floor(n) : undefined;
+}
 
 /**
  * Propriétaire de l'unique connexion NATS.
@@ -32,8 +38,24 @@ export class NatsConnectionManager implements OnModuleInit, OnModuleDestroy {
   private stopped = false;
   private probeTimer?: ReturnType<typeof setInterval>;
 
+  /**
+   * JetStream : quand activé (`MESSAGING_NATS_JETSTREAM=true`), l'outbox publie
+   * dans un stream persistant (`MESSAGING_NATS_STREAM_NAME`, défaut `MESSAGING`,
+   * sujets `messaging.>`) au lieu du core NATS fire-and-forget. Le stream est
+   * créé/mis à jour à la connexion (best-effort).
+   */
+  readonly jetstreamEnabled: boolean;
+  private readonly streamName: string;
+  private readonly streamMaxAgeMs?: number;
+
   constructor(config: ConfigService) {
     this.servers = config.get<string>('MESSAGING_NATS_URL') ?? DEFAULT_NATS_URL;
+    this.jetstreamEnabled =
+      (config.get<string>('MESSAGING_NATS_JETSTREAM') ?? '').trim().toLowerCase() === 'true';
+    this.streamName = config.get<string>('MESSAGING_NATS_STREAM_NAME')?.trim() || 'MESSAGING';
+    this.streamMaxAgeMs = optionalPositiveInt(
+      config.get<string>('MESSAGING_NATS_STREAM_MAX_AGE_MS'),
+    );
   }
 
   onModuleInit(): void {
@@ -67,6 +89,16 @@ export class NatsConnectionManager implements OnModuleInit, OnModuleDestroy {
     return this.conn && !this.conn.isClosed() ? this.conn : null;
   }
 
+  /**
+   * Client JetStream si (et seulement si) JetStream est activé ET la connexion
+   * est établie. `null` sinon — l'appelant retombe alors sur `connection`
+   * (publication core).
+   */
+  jetstream(): JetStreamClient | null {
+    const conn = this.connection;
+    return this.jetstreamEnabled && conn ? conn.jetstream() : null;
+  }
+
   /** Pour `GET /health`. `disabled` n'existe plus : on retente toujours. */
   get status(): 'ok' | 'down' {
     return this.connection ? 'ok' : 'down';
@@ -87,6 +119,9 @@ export class NatsConnectionManager implements OnModuleInit, OnModuleDestroy {
       });
       this.conn = conn;
       this.logger.log(`Connected to NATS at ${this.servers}`);
+      if (this.jetstreamEnabled) {
+        await this.ensureStream(conn);
+      }
       void conn.closed().then((err?: void | Error) => {
         if (this.conn === conn) {
           this.conn = null;
@@ -103,6 +138,42 @@ export class NatsConnectionManager implements OnModuleInit, OnModuleDestroy {
       );
     } finally {
       this.connecting = false;
+    }
+  }
+
+  /**
+   * Crée le stream JetStream (ou aligne sa config s'il existe déjà) qui capture
+   * tous nos sujets `messaging.>`. Best-effort : un échec (JetStream non activé
+   * côté serveur, droits manquants) est journalisé mais ne bloque pas le
+   * démarrage — l'outbox retombera sur la publication core.
+   */
+  private async ensureStream(conn: NatsConnection): Promise<void> {
+    const config = {
+      name: this.streamName,
+      subjects: ['messaging.>'],
+      retention: RetentionPolicy.Limits,
+      ...(this.streamMaxAgeMs
+        ? { max_age: this.streamMaxAgeMs * 1_000_000 } // ms -> ns
+        : {}),
+    };
+    try {
+      const jsm = await conn.jetstreamManager();
+      const exists = await jsm.streams
+        .info(this.streamName)
+        .then(() => true)
+        .catch(() => false);
+      if (exists) {
+        await jsm.streams.update(this.streamName, config);
+        this.logger.log(`JetStream stream "${this.streamName}" updated`);
+      } else {
+        await jsm.streams.add(config);
+        this.logger.log(`JetStream stream "${this.streamName}" created (subjects: messaging.>)`);
+      }
+    } catch (err) {
+      this.logger.warn(
+        `Could not ensure JetStream stream "${this.streamName}" ` +
+          `(${(err as Error).message}); outbox will fall back to core publish`,
+      );
     }
   }
 }

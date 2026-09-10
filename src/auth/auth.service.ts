@@ -2,9 +2,22 @@ import { Injectable, UnauthorizedException } from '@nestjs/common';
 import { JwtService } from '@nestjs/jwt';
 import { AuthUser } from './auth-user.interface';
 
-/** Claims attendus dans le JWT. Seul `sub` est exploité. */
+/**
+ * Claims lus dans le JWT. `sub` est obligatoire (identité). `roles` est optionnel
+ * et n'est exploité que si l'hôte le fournit — voir `RolesGuard` : tant qu'aucun
+ * handler n'est décoré `@Roles(...)`, l'absence de ce claim n'a aucun effet.
+ */
 interface JwtPayload {
   sub?: string;
+  roles?: unknown;
+}
+
+/** Ne garde que des chaînes non vides ; toute autre forme → `[]`. */
+function normalizeRoles(raw: unknown): string[] {
+  if (!Array.isArray(raw)) {
+    return [];
+  }
+  return raw.filter((r): r is string => typeof r === 'string' && r.trim() !== '');
 }
 
 /**
@@ -36,6 +49,7 @@ export class AuthService {
       throw new UnauthorizedException('Token is missing the "sub" claim');
     }
 
-    return { id: payload.sub };
+    const roles = normalizeRoles(payload.roles);
+    return roles.length > 0 ? { id: payload.sub, roles } : { id: payload.sub };
   }
 }

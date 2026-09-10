@@ -4,6 +4,7 @@ import {
   ConnectedSocket,
   MessageBody,
   OnGatewayConnection,
+  OnGatewayDisconnect,
   SubscribeMessage,
   WebSocketGateway,
   WebSocketServer,
@@ -28,6 +29,7 @@ import {
   MessageReadEvent,
 } from '../common/events';
 import { corsOriginCheck } from '../common/cors';
+import { MetricsService } from '../metrics/metrics.service';
 import { MessagesService } from '../messages/messages.service';
 import { WsConversationDto, WsSendMessageDto } from './dto/ws-messages.dto';
 import { WsRateLimiterService } from './rate-limiter.service';
@@ -57,9 +59,10 @@ const ipOf = (client: Socket): string => clientIpFromHandshake(client.handshake)
  * Gateway temps réel (Socket.IO).
  *
  * Deux sens :
- *   - entrant  : `conversation:join` / `conversation:leave` / `message:send` ;
- *   - sortant  : `message:new` / `message:read`, poussés dans la room à la
- *     réception des événements internes émis par MessagesService.
+ *   - entrant  : `conversation:join` / `conversation:leave` / `message:send` /
+ *     `typing:start` / `typing:stop` ;
+ *   - sortant  : `message:new` / `message:read` / `typing`, poussés dans la room
+ *     à la réception des événements internes émis par MessagesService.
  *
  * CORS Socket.IO : même liste blanche que le CORS HTTP (`corsOriginCheck`,
  * pilotée par `MESSAGING_CORS_ORIGINS`).
@@ -67,7 +70,7 @@ const ipOf = (client: Socket): string => clientIpFromHandshake(client.handshake)
 @UseFilters(new WsExceptionFilter())
 @UsePipes(new ValidationPipe({ whitelist: true, transform: true, forbidNonWhitelisted: true }))
 @WebSocketGateway({ cors: { origin: corsOriginCheck } })
-export class MessagingGateway implements OnGatewayConnection {
+export class MessagingGateway implements OnGatewayConnection, OnGatewayDisconnect {
   private readonly logger = new Logger(MessagingGateway.name);
 
   @WebSocketServer()
@@ -77,16 +80,17 @@ export class MessagingGateway implements OnGatewayConnection {
     private readonly authService: AuthService,
     private readonly messages: MessagesService,
     private readonly rateLimiter: WsRateLimiterService,
+    private readonly metrics: MetricsService,
   ) {}
 
   /**
    * Les guards ne s'exécutent pas sur l'événement de connexion : on valide donc
    * le JWT du handshake ici et on rejette le socket si besoin.
    */
-  handleConnection(client: Socket): void {
+  async handleConnection(client: Socket): Promise<void> {
     // Rate limit du handshake, par IP : coupe un flood de connexions avant
     // même la vérification JWT.
-    if (!this.rateLimiter.allowConnection(ipOf(client))) {
+    if (!(await this.rateLimiter.allowConnection(ipOf(client)))) {
       this.logger.warn(`Rejected socket ${client.id}: connection rate limit`);
       client.disconnect(true);
       return;
@@ -98,9 +102,17 @@ export class MessagingGateway implements OnGatewayConnection {
       // Room personnelle : permet de notifier cet utilisateur hors de toute
       // room de conversation (cf. `broadcastMessageCreated`).
       void client.join(userRoom(user.id));
+      this.metrics.incWsConnection();
     } catch (err) {
       this.logger.warn(`Rejected socket ${client.id}: ${(err as Error).message}`);
       client.disconnect(true);
+    }
+  }
+
+  /** Décrémente la jauge — uniquement pour les sockets qui avaient été authentifiées. */
+  handleDisconnect(client: Socket): void {
+    if (userOf(client)) {
+      this.metrics.decWsConnection();
     }
   }
 
@@ -134,19 +146,54 @@ export class MessagingGateway implements OnGatewayConnection {
 
   /** Équivalent WebSocket de `POST /conversations/:id/messages`. */
   @SubscribeMessage('message:send')
-  sendMessage(@ConnectedSocket() client: Socket, @MessageBody() body: WsSendMessageDto) {
+  async sendMessage(@ConnectedSocket() client: Socket, @MessageBody() body: WsSendMessageDto) {
     const user = userOf(client);
     if (!user) {
       // Filet de sécurité : ne devrait pas arriver, handleConnection ayant déjà rejeté.
       throw new WsException('Unauthorized');
     }
-    if (!this.rateLimiter.allowMessage(user.id, client.id)) {
+    if (!(await this.rateLimiter.allowMessage(user.id, client.id))) {
       throw new WsException('Message rate limit exceeded, slow down');
     }
+    this.metrics.incWsMessage();
     return this.messages.send(body.conversationId, user.id, {
       content: body.content,
       metadata: body.metadata,
     });
+  }
+
+  /**
+   * Indicateur « en train d'écrire ». Éphémère : rien n'est persisté, l'événement
+   * `typing` est simplement relayé aux AUTRES sockets de la room de la
+   * conversation (le client doit débouncer et émettre `typing:stop` à l'arrêt de
+   * frappe / à l'envoi). Un refus de rate limit est silencieux.
+   */
+  @SubscribeMessage('typing:start')
+  typingStart(@ConnectedSocket() client: Socket, @MessageBody() body: WsConversationDto) {
+    return this.relayTyping(client, body.conversationId, true);
+  }
+
+  @SubscribeMessage('typing:stop')
+  typingStop(@ConnectedSocket() client: Socket, @MessageBody() body: WsConversationDto) {
+    return this.relayTyping(client, body.conversationId, false);
+  }
+
+  private async relayTyping(
+    client: Socket,
+    conversationId: string,
+    typing: boolean,
+  ): Promise<void> {
+    const user = userOf(client);
+    if (!user) {
+      throw new WsException('Unauthorized');
+    }
+    if (!(await this.rateLimiter.allowTyping(user.id, client.id))) {
+      return;
+    }
+    // Empêche d'usurper un fil dont on n'est pas participant : sans ce contrôle,
+    // une socket pourrait pousser un faux « typing » dans la room d'autrui.
+    await this.messages.assertParticipant(conversationId, user.id);
+    client.to(room(conversationId)).emit('typing', { conversationId, userId: user.id, typing });
   }
 
   // --- Relais des événements internes vers la room -------------------------- //

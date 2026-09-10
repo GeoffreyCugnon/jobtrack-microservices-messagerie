@@ -35,3 +35,13 @@ export const WS_CONNECT_THROTTLE = {
   windowMs: positiveInt(process.env.MESSAGING_WS_CONNECT_TTL_MS, 60_000),
   limit: positiveInt(process.env.MESSAGING_WS_CONNECT_LIMIT, 10),
 } as const;
+
+/**
+ * Indicateur `typing:start` / `typing:stop` : fenêtre glissante par utilisateur.
+ * Volontairement large (le client doit déjà débouncer) — c'est un simple
+ * garde-fou anti-spam, un événement perdu est sans conséquence.
+ */
+export const WS_TYPING_THROTTLE = {
+  windowMs: positiveInt(process.env.MESSAGING_WS_TYPING_TTL_MS, 10_000),
+  limit: positiveInt(process.env.MESSAGING_WS_TYPING_LIMIT, 20),
+} as const;

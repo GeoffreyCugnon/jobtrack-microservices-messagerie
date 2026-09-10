@@ -18,7 +18,8 @@ Le code fourni est volontairement minimal : c'est un squelette fonctionnel, pas 
 - **REST** : header `Authorization: Bearer <jwt>`.
 - **WebSocket** : `io(url, { auth: { token: '<jwt>' } })` (ou header `Authorization`, ou `?token=<jwt>`).
 - Le service **n'émet pas** de token : c'est au projet hôte de le générer et de le distribuer à ses clients.
-- Seule exception au guard : `GET /health`, volontairement public.
+- Exceptions au guard : `GET /health`, `GET /metrics` et `GET /docs`, volontairement publics.
+- Un `RolesGuard` lit le claim optionnel **`roles`** du JWT, mais reste **inactif** tant qu'aucun handler n'est décoré `@Roles(...)` (aucun aujourd'hui — l'hôte JobTrack n'émet pas ce claim).
 
 ## CORS
 
@@ -70,10 +71,12 @@ npm run seed:demo              # amorce une conversation Alice↔Bob (6 messages
 | `DELETE` | `/messages/:id` | Soft-delete d'un message (**expéditeur uniquement** ; idempotent) |
 | `POST` | `/messages/:id/restore` | Restaure un message soft-deleté (expéditeur ; **200**) |
 | `GET` | `/health` | Sonde **publique** (sans JWT, hors rate limiting) : `{ status, database, nats, outboxPending }` — **HTTP 503** si `database` est `down` |
+| `GET` | `/metrics` | Exposition **Prometheus** (publique, hors rate limiting) : métriques HTTP (`http_requests_total`, `http_request_duration_seconds`), WebSocket (`ws_connections_active`, `ws_messages_sent_total`), `outbox_pending_events`, + métriques process par défaut |
+| `GET` | `/docs` | Documentation **OpenAPI** interactive (Swagger UI). Désactivable via `MESSAGING_ENABLE_DOCS=false` |
 
 Pagination (`GET /conversations` et `GET /conversations/:id/messages`) : la réponse est `{ "items": [...], "nextCursor": "<id|null>" }`. Repasser `nextCursor` dans `?cursor=` pour la page suivante. Les messages sont renvoyés du **plus récent au plus ancien** ; les conversations, les plus récemment actives d'abord.
 
-Toutes les routes REST **sauf `/health`** sont soumises à un rate limiting par IP (`429 Too Many Requests` au-delà) — cf. section *Rate limiting*.
+Toutes les routes REST **sauf `/health` et `/metrics`** sont soumises à un rate limiting par IP (`429 Too Many Requests` au-delà) — cf. section *Rate limiting*.
 
 ## WebSocket (Socket.IO)
 
@@ -86,6 +89,7 @@ Une **room par conversation** : `conversation:{id}`.
 | `conversation:join` | `{ conversationId }` | Rejoint la room (ack `conversation:joined`) |
 | `conversation:leave` | `{ conversationId }` | Quitte la room (ack `conversation:left`) |
 | `message:send` | `{ conversationId, content, metadata? }` | Crée le message (équivalent du `POST` REST) — **rate-limité** (5 / 10 s par utilisateur ; `WsException` au-delà) |
+| `typing:start` / `typing:stop` | `{ conversationId }` | Indicateur « en train d'écrire » — contrôle de participation, **rate-limité** (20 / 10 s par utilisateur ; refus **silencieux**). Rien n'est persisté |
 
 La **connexion** WebSocket elle-même est rate-limitée par IP (10 tentatives / 60 s ; socket rejeté au-delà).
 
@@ -99,6 +103,7 @@ La **connexion** WebSocket elle-même est rate-limitée par IP (10 tentatives / 
 | `message:deleted` | room `conversation:{id}` | `{ conversationId, messageId, deletedBy }` |
 | `conversation:read` | room `conversation:{id}` | `{ conversationId, readBy, readAt, count }` (après `PATCH …/messages/read`) |
 | `conversation:updated` | room perso `user:{id}` de chaque participant | `{ conversationId }` — signal léger pour rafraîchir la liste des conversations |
+| `typing` | room `conversation:{id}` (hors émetteur) | `{ conversationId, userId, typing }` — `typing` vaut `true` (`typing:start`) ou `false` (`typing:stop`) |
 
 La diffusion est découplée des services métier via un `EventEmitter` interne : `MessagesService` émet un événement de domaine, `MessagingGateway` le relaie aux rooms.
 
@@ -107,7 +112,7 @@ La diffusion est découplée des services métier via un `EventEmitter` interne 
 Ce service **publie** des événements sur NATS après chaque écriture réussie en base. C'est un **contrat d'intégration ouvert** : n'importe quel micro-service (par ex. un futur MS de notifications) peut s'y abonner pour réagir, **sans dépendance directe à ce service** et **sans jamais interroger sa base de données**.
 
 - NATS sert **uniquement** au pub/sub sortant. Les appels de l'application hôte vers ce service restent en **REST** ; NATS ne les remplace pas.
-- **Outbox transactionnel durable** ([src/nats/outbox.service.ts](src/nats/outbox.service.ts)) : `OutboxService.enqueueInTx(tx, subject, payload)` insère la ligne `OutboxEvent` **dans la même transaction Prisma** que l'écriture métier. Un job de drain (toutes les 5 s + réveil après chaque commit) publie les lignes `publishedAt IS NULL` sur NATS, `flush()` avant de marquer publié, retente avec backoff `[1 s, 5 s, 15 s, 60 s, 300 s]` puis marque `failedAt`. Garantie **at-least-once** (consommateurs à rendre idempotents). Ne bloque jamais la transaction métier.
+- **Outbox transactionnel durable** ([src/nats/outbox.service.ts](src/nats/outbox.service.ts)) : `OutboxService.enqueueInTx(tx, subject, payload)` insère la ligne `OutboxEvent` **dans la même transaction Prisma** que l'écriture métier. Un job de drain (toutes les 5 s + réveil après chaque commit) publie les lignes `publishedAt IS NULL` sur NATS — en core, `flush()` avant de marquer publié ; en JetStream, `js.publish()` attend directement l'ACK — puis retente avec backoff `[1 s, 5 s, 15 s, 60 s, 300 s]` avant de marquer `failedAt`. Garantie **at-least-once** (consommateurs à rendre idempotents). Ne bloque jamais la transaction métier.
 - Encodage : JSON (`JSONCodec`). Les `Date` sont sérialisées en ISO 8601 (chaîne, stockée telle quelle dans `OutboxEvent.payload`).
 
 | Sujet | Payload | Déclenché après |
@@ -121,20 +126,25 @@ L'édition et la suppression de messages ne publient **pas** sur NATS (contrat v
 
 Configuration : `MESSAGING_NATS_URL` (ex. `nats://localhost:4222`), `MESSAGING_OUTBOX_DRAIN_MS` (défaut 5000). `NatsConnectionManager` possède la connexion (reconnexion automatique + re-probe si down au démarrage) ; `OutboxService` est appelé depuis `ConversationsService` et `MessagesService`.
 
+**JetStream (optionnel)** : `MESSAGING_NATS_JETSTREAM=true` fait publier l'outbox dans un stream persistant (`MESSAGING_NATS_STREAM_NAME`, défaut `MESSAGING`, sujets `messaging.>`, `MESSAGING_NATS_STREAM_MAX_AGE_MS` optionnel) créé/aligné à la connexion — `js.publish()` attend l'ACK serveur (pas de `flush`). Sans ça, publication core NATS fire-and-forget + `flush()`. Les sujets et payloads reçus par les consommateurs sont identiques.
+
 ## Rate limiting
 
-- **REST** — `RestRateLimitGuard` (fenêtre glissante en mémoire, même implémentation que le WS ; `@nestjs/throttler` n'avait pas de version compatible NestJS 11/12), par IP, sur toutes les routes sauf `/health`. `429 Too Many Requests` au-delà. Défaut **100 req / 60 s**, surchargeable : `MESSAGING_REST_THROTTLE_LIMIT`, `MESSAGING_REST_THROTTLE_TTL_MS`.
-- **WebSocket** — `WsRateLimiterService` (fenêtre glissante en mémoire) :
+- **REST** — `RestRateLimitGuard`, par IP, sur toutes les routes sauf `/health` et `/metrics`. `429 Too Many Requests` au-delà. Défaut **100 req / 60 s**, surchargeable : `MESSAGING_REST_THROTTLE_LIMIT`, `MESSAGING_REST_THROTTLE_TTL_MS`.
+- **WebSocket** — `WsRateLimiterService` :
   - `message:send` : **5 / 10 s par utilisateur** (`MESSAGING_WS_SEND_LIMIT`, `MESSAGING_WS_SEND_TTL_MS`) — `WsException` au-delà ;
+  - `typing:start` / `typing:stop` : **20 / 10 s par utilisateur** (`MESSAGING_WS_TYPING_LIMIT`, `MESSAGING_WS_TYPING_TTL_MS`) — refus silencieux ;
   - handshake de connexion : **10 / 60 s par IP** (`MESSAGING_WS_CONNECT_LIMIT`, `MESSAGING_WS_CONNECT_TTL_MS`) — socket rejeté au-delà.
+- **Backend** — `RateLimiterFactory` choisit au démarrage :
+  - **mémoire process** (fenêtre glissante exacte) par défaut — cohérent avec « une instance isolée par projet hôte » ;
+  - **Redis partagé** (fenêtre fixe `INCR`+`PEXPIRE`) si `MESSAGING_REDIS_URL` est défini — buckets communs à toutes les instances derrière un load-balancer.
 - **Derrière un reverse proxy**, la clé de bucket doit être l'IP du client final, pas celle du proxy : `MESSAGING_TRUST_PROXY` (défaut `1` — un hop) pilote `app.set('trust proxy', …)` (Express → `req.ip` depuis `X-Forwarded-For`) et la résolution d'IP du handshake WebSocket. Mettre `false` pour une exposition directe.
-- Stockage **en mémoire process** : cohérent avec le modèle « une instance isolée par projet hôte ». Pour du multi-instance derrière un load-balancer, remplacer par un store partagé (Redis).
 - Les défauts sont volontairement plus permissifs que les valeurs indicatives de l'audit (cf. commentaires dans `.env.example`) : protéger d'un flood sans gêner un usage normal.
 
 ## Sécurité complémentaire
 
 - **Chiffrement du contenu au repos** — si `MESSAGING_CONTENT_ENCRYPTION_KEY` (32 octets, base64/hex) est défini, `Message.content` et `MessageVersion.content` sont chiffrés en **AES-256-GCM** (format `v1:<iv>:<tag>:<ciphertext>`). Sans clé : stockage en clair, rétro-compatible. Les clients (REST + WebSocket) reçoivent **toujours** le contenu en clair ; les payloads NATS n'ont jamais porté de contenu. Les lignes en clair écrites avant l'activation de la clé restent lisibles — ne pas retirer/roter la clé tant que des lignes `v1:` existent.
-- **Expiration des tokens** — `MESSAGING_JWT_MAX_AGE` (ex. `24h`, `3600`) rejette tout JWT dont l'`iat` dépasse cet âge (garde-fou contre un token sans `exp`). Non activé par défaut.
+- **Expiration des tokens** — `MESSAGING_JWT_MAX_AGE` (ex. `24h`, `3600`) rejette tout JWT dont l'`iat` dépasse cet âge (garde-fou contre un token sans `exp`). **Activé par défaut à `24h`** ; mettre `off` pour désactiver.
 - **Journal d'audit** — `AuditService` (best-effort, ne bloque jamais) écrit dans la table `AuditLog` : `conversation.{created,deleted,restored,read}`, `message.{sent,read,edited,deleted,restored}`. Aucune route de lecture exposée (accès base / outil d'exploitation).
 - **Soft-delete** — conversations et messages portent un `deletedAt` ; toutes les lectures filtrent `deletedAt IS NULL`. Rien n'est purgé physiquement par le service.
 
@@ -154,16 +164,19 @@ Si Prisma signale une dérive sur la migration d'init (générée à la main pou
 
 ```
 src/
-  auth/          AppAuthGuard (+ @Public), AuthService (vérif JWT + maxAge optionnel), @CurrentUser
+  auth/          AppAuthGuard (+ @Public), RolesGuard (+ @Roles), AuthService (vérif JWT + maxAge + roles), @CurrentUser
   conversations/ ConversationsModule — création/liste paginée, soft-delete/restore, publie messaging.conversation.{created,read}
   messages/      MessagesModule — envoi, lecture, pagination, édition + versions, soft-delete/restore ; ContentCipherService
-  messaging/     MessagingGateway — Socket.IO, room par conversation ; WsRateLimiterService ; WsExceptionFilter
-  nats/          NatsModule — NatsConnectionManager (reconnexion), OutboxService (outbox transactionnel durable), sujets & payloads
+  messaging/     MessagingGateway — Socket.IO, room par conversation, typing ; WsRateLimiterService ; WsExceptionFilter
+  nats/          NatsModule — NatsConnectionManager (reconnexion + JetStream optionnel), OutboxService (outbox durable), sujets
   audit/         AuditModule — AuditService (journal best-effort, table AuditLog)
+  metrics/       MetricsModule — GET /metrics (Prometheus), MetricsInterceptor (durée/volume HTTP)
+  retention/     RetentionModule — RetentionService (@Cron 03:00 : purge AuditLog + OutboxEvent)
+  observability/ nestjs-pino (logs JSON + x-request-id), AllExceptionsFilter (réponse d'erreur uniforme)
   health/        HealthController — GET /health public (sonde Prisma + NATS + outbox pending ; 503 si DB down)
   prisma/        PrismaService / PrismaModule
-  common/        événements internes, CORS partagé, trust proxy, rate limit (guard REST + constantes), ContentCipherService,
-                 validateurs (assert, @MaxJsonSize), helpers de test
+  common/        événements internes, CORS partagé, trust proxy, rate limit (guard REST + factory mémoire/Redis + constantes),
+                 ContentCipherService, validateurs (assert, @MaxJsonSize), helpers de test
 scripts/
   smoke-test.ts  test manuel end-to-end sur infra réelle (npm run smoke-test)
   mint-token.ts  génère un JWT accepté par le service (npm run token)
@@ -173,12 +186,14 @@ scripts/
 ## Tests
 
 ```bash
-npm test          # ~96 tests unitaires : guard, services conversations & messages (envoi, lecture, édition/versions,
-                  #   soft-delete, transaction + outbox), OutboxService, NatsConnectionManager, ContentCipherService,
-                  #   AuditService, WsRateLimiterService, CORS, @MaxJsonSize
+npm test          # ~134 tests unitaires : guards (auth + roles), services conversations & messages (envoi, lecture,
+                  #   édition/versions, soft-delete, transaction + outbox), OutboxService (+ JetStream), NatsConnectionManager,
+                  #   ContentCipherService, AuditService, RetentionService, MetricsService, rate limiter (mémoire + factory),
+                  #   WsRateLimiterService, gateway (+ typing), CORS, @MaxJsonSize
 npm run test:e2e  # e2e (Prisma + NATS mockés) : boot, guard sur les routes, validation 400, rate limit 429,
-                  #   GET /health public, routes soft-delete/edit guardées
+                  #   GET /health public, GET /metrics, header x-request-id, routes soft-delete/edit guardées
 npm run typecheck # tsc --noEmit (src + test + scripts)
+npm run lint:ci   # eslint --max-warnings 0 (sans --fix) — utilisé par la CI
 ```
 
 ### Smoke test end-to-end (manuel, infra réelle)
@@ -204,8 +219,19 @@ Le script (via `tsx`, `dotenv` pour lire `.env`) : génère 2 JWT HS256 pour deu
 MESSAGING_JWT_SECRET=$(openssl rand -hex 32) docker compose up --build
 ```
 
-`docker-compose.yml` monte : `postgres` (avec healthcheck), `nats`, un service **`migrate`** one-shot (`prisma migrate deploy`, exécuté avant l'app) puis `ms-messagerie`. Le `Dockerfile` est multi-stage : `builder` (toolchain complète + `prisma generate` + `nest build`, réutilisé comme cible du `migrate`) et `runtime` (`node:20-alpine`, deps de prod uniquement, `dist/` — Prisma 7 en mode driver-adapter n'embarque pas de binaire moteur). Le healthcheck du conteneur interroge `GET /health` (503 si la base est injoignable). Variables surchargeables : `MESSAGING_CORS_ORIGINS`, `MESSAGING_TRUST_PROXY`, `MESSAGING_JWT_MAX_AGE`, `MESSAGING_CONTENT_ENCRYPTION_KEY`.
+> ⚠️ Le `Dockerfile` / `docker-compose.yml` n'ont **pas encore été `docker build`-és** (pas de Docker dans l'environnement de dev). Faire un `docker compose up --build` réel avant tout déploiement.
+
+`docker-compose.yml` monte : `postgres` (avec healthcheck), `nats`, un service **`migrate`** one-shot (`prisma migrate deploy`, exécuté avant l'app) puis `ms-messagerie`. Le `Dockerfile` est multi-stage : `builder` (toolchain complète + `prisma generate` + `nest build`, réutilisé comme cible du `migrate`) et `runtime` (`node:20-alpine`, deps de prod uniquement, `dist/` — Prisma 7 en mode driver-adapter n'embarque pas de binaire moteur). Le healthcheck du conteneur interroge `GET /health` (503 si la base est injoignable). Variables surchargeables : `MESSAGING_CORS_ORIGINS`, `MESSAGING_TRUST_PROXY`, `MESSAGING_JWT_MAX_AGE`, `MESSAGING_CONTENT_ENCRYPTION_KEY`, `MESSAGING_REDIS_URL`, `MESSAGING_NATS_JETSTREAM`, `MESSAGING_LOG_LEVEL`, `MESSAGING_ENABLE_DOCS`, `MESSAGING_RETENTION_*` (cf. `.env.example`).
+
+## Observabilité & durcissement
+
+- **Logs** structurés JSON (`nestjs-pino`), un `x-request-id` par requête (header entrant réutilisé, sinon généré) propagé dans chaque ligne et renvoyé au client. Niveau : `MESSAGING_LOG_LEVEL`.
+- **Erreurs** : `AllExceptionsFilter` renvoie `{ statusCode, error, message, timestamp, path, requestId }` ; 5xx logués avec la stack.
+- **Métriques** Prometheus sur `GET /metrics`. **OpenAPI** sur `GET /docs` (`MESSAGING_ENABLE_DOCS=false` pour couper).
+- **En-têtes** : `helmet` (CSP désactivée — API + Swagger UI ; CORP `cross-origin`).
+- **Rétention** : purge quotidienne (`AuditLog`, `OutboxEvent`), cf. `MESSAGING_RETENTION_*`.
+- **CI** : `.github/workflows/ci.yml` (`lint:ci` → `typecheck` → `build` → `test` → `test:e2e`, sans infra).
 
 ## Hors périmètre
 
-Pas de présence/typing ni de persistance des rooms. Pas de `RolesGuard` (rôles/permissions). Côté durcissement, restent hors périmètre : `helmet`, logs structurés + request-id, métriques Prometheus, OpenAPI. À compléter selon les besoins du projet hôte.
+Pas de **présence** ni de persistance des rooms. `RolesGuard` est en place mais **inactif** tant qu'aucun handler n'est décoré `@Roles(...)` et que l'hôte JobTrack n'ajoute pas de claim `roles` au JWT de messagerie. Sentry / error tracking : non retenu.
