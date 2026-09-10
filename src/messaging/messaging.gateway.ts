@@ -29,9 +29,11 @@ import {
   MessageReadEvent,
 } from '../common/events';
 import { corsOriginCheck } from '../common/cors';
+import { ConversationsService } from '../conversations/conversations.service';
 import { MetricsService } from '../metrics/metrics.service';
 import { MessagesService } from '../messages/messages.service';
 import { WsConversationDto, WsSendMessageDto } from './dto/ws-messages.dto';
+import { PresenceService } from './presence.service';
 import { WsRateLimiterService } from './rate-limiter.service';
 
 /** Nom de la room Socket.IO pour une conversation donnée. */
@@ -60,9 +62,12 @@ const ipOf = (client: Socket): string => clientIpFromHandshake(client.handshake)
  *
  * Deux sens :
  *   - entrant  : `conversation:join` / `conversation:leave` / `message:send` /
- *     `typing:start` / `typing:stop` ;
+ *     `typing:start` / `typing:stop` / `presence:query` ;
  *   - sortant  : `message:new` / `message:read` / `typing`, poussés dans la room
- *     à la réception des événements internes émis par MessagesService.
+ *     à la réception des événements internes émis par MessagesService ;
+ *     `presence` (interlocuteur en ligne / hors ligne) et `presence:snapshot`
+ *     (liste des interlocuteurs déjà en ligne), poussés dans la room
+ *     personnelle `user:*`.
  *
  * CORS Socket.IO : même liste blanche que le CORS HTTP (`corsOriginCheck`,
  * pilotée par `MESSAGING_CORS_ORIGINS`).
@@ -81,6 +86,8 @@ export class MessagingGateway implements OnGatewayConnection, OnGatewayDisconnec
     private readonly messages: MessagesService,
     private readonly rateLimiter: WsRateLimiterService,
     private readonly metrics: MetricsService,
+    private readonly presence: PresenceService,
+    private readonly conversations: ConversationsService,
   ) {}
 
   /**
@@ -103,16 +110,30 @@ export class MessagingGateway implements OnGatewayConnection, OnGatewayDisconnec
       // room de conversation (cf. `broadcastMessageCreated`).
       void client.join(userRoom(user.id));
       this.metrics.incWsConnection();
+      // Présence : compte la socket puis, en tâche de fond, envoie à ce client
+      // la liste de ses interlocuteurs déjà en ligne et — si c'est sa première
+      // socket — prévient ces interlocuteurs qu'il vient de se connecter.
+      const becameOnline = this.presence.connect(user.id);
+      void this.publishPresenceOnConnect(client, user.id, becameOnline);
     } catch (err) {
       this.logger.warn(`Rejected socket ${client.id}: ${(err as Error).message}`);
       client.disconnect(true);
     }
   }
 
-  /** Décrémente la jauge — uniquement pour les sockets qui avaient été authentifiées. */
+  /**
+   * Décrémente la jauge et met à jour la présence — uniquement pour les sockets
+   * qui avaient été authentifiées. Si c'était la dernière socket de
+   * l'utilisateur, ses interlocuteurs sont prévenus qu'il passe hors ligne.
+   */
   handleDisconnect(client: Socket): void {
-    if (userOf(client)) {
-      this.metrics.decWsConnection();
+    const user = userOf(client);
+    if (!user) {
+      return;
+    }
+    this.metrics.decWsConnection();
+    if (this.presence.disconnect(user.id)) {
+      void this.publishPresence(user.id, false);
     }
   }
 
@@ -178,6 +199,22 @@ export class MessagingGateway implements OnGatewayConnection, OnGatewayDisconnec
     return this.relayTyping(client, body.conversationId, false);
   }
 
+  /**
+   * Snapshot de présence à la demande : renvoie, dans `presence:snapshot`, les
+   * interlocuteurs de l'appelant actuellement en ligne. Utile après une
+   * reconnexion socket (le snapshot est aussi poussé automatiquement à la
+   * connexion).
+   */
+  @SubscribeMessage('presence:query')
+  async presenceQuery(@ConnectedSocket() client: Socket): Promise<void> {
+    const user = userOf(client);
+    if (!user) {
+      throw new WsException('Unauthorized');
+    }
+    const partnerIds = await this.conversations.listPartnerIds(user.id);
+    client.emit('presence:snapshot', { online: this.presence.filterOnline(partnerIds) });
+  }
+
   private async relayTyping(
     client: Socket,
     conversationId: string,
@@ -240,6 +277,50 @@ export class MessagingGateway implements OnGatewayConnection, OnGatewayDisconnec
   private notifyParticipants(participantIds: string[], conversationId: string): void {
     for (const userId of participantIds) {
       this.server.to(userRoom(userId)).emit('conversation:updated', { conversationId });
+    }
+  }
+
+  // --- Présence ----------------------------------------------------------- //
+
+  /**
+   * À la connexion : envoie à la nouvelle socket la liste de ses interlocuteurs
+   * déjà en ligne (`presence:snapshot`) et, si l'utilisateur vient de passer en
+   * ligne, prévient ces interlocuteurs (`presence`). Best-effort : une erreur
+   * ici (DB indisponible) ne doit pas faire échouer la connexion.
+   */
+  private async publishPresenceOnConnect(
+    client: Socket,
+    userId: string,
+    becameOnline: boolean,
+  ): Promise<void> {
+    try {
+      const partnerIds = await this.conversations.listPartnerIds(userId);
+      client.emit('presence:snapshot', { online: this.presence.filterOnline(partnerIds) });
+      if (becameOnline) {
+        this.emitPresence(partnerIds, userId, true);
+      }
+    } catch (err) {
+      this.logger.warn(`presence(connect) for ${userId}: ${(err as Error).message}`);
+    }
+  }
+
+  /**
+   * Prévient les interlocuteurs de `userId` d'un changement d'état de présence.
+   * Best-effort (appelé depuis `handleDisconnect`, hors de tout try/catch).
+   */
+  private async publishPresence(userId: string, online: boolean): Promise<void> {
+    try {
+      const partnerIds = await this.conversations.listPartnerIds(userId);
+      this.emitPresence(partnerIds, userId, online);
+    } catch (err) {
+      this.logger.warn(`presence(update) for ${userId}: ${(err as Error).message}`);
+    }
+  }
+
+  /** Pousse `presence` dans la room personnelle de chaque interlocuteur. */
+  private emitPresence(partnerIds: string[], userId: string, online: boolean): void {
+    for (const partnerId of partnerIds) {
+      this.server.to(userRoom(partnerId)).emit('presence', { userId, online });
     }
   }
 }

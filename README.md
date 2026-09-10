@@ -90,6 +90,7 @@ Une **room par conversation** : `conversation:{id}`.
 | `conversation:leave` | `{ conversationId }` | Quitte la room (ack `conversation:left`) |
 | `message:send` | `{ conversationId, content, metadata? }` | Crée le message (équivalent du `POST` REST) — **rate-limité** (5 / 10 s par utilisateur ; `WsException` au-delà) |
 | `typing:start` / `typing:stop` | `{ conversationId }` | Indicateur « en train d'écrire » — contrôle de participation, **rate-limité** (20 / 10 s par utilisateur ; refus **silencieux**). Rien n'est persisté |
+| `presence:query` | `—` | Redemande un `presence:snapshot` des interlocuteurs en ligne (utile après une reconnexion ; le snapshot est aussi poussé automatiquement à la connexion) |
 
 La **connexion** WebSocket elle-même est rate-limitée par IP (10 tentatives / 60 s ; socket rejeté au-delà).
 
@@ -104,8 +105,12 @@ La **connexion** WebSocket elle-même est rate-limitée par IP (10 tentatives / 
 | `conversation:read` | room `conversation:{id}` | `{ conversationId, readBy, readAt, count }` (après `PATCH …/messages/read`) |
 | `conversation:updated` | room perso `user:{id}` de chaque participant | `{ conversationId }` — signal léger pour rafraîchir la liste des conversations |
 | `typing` | room `conversation:{id}` (hors émetteur) | `{ conversationId, userId, typing }` — `typing` vaut `true` (`typing:start`) ou `false` (`typing:stop`) |
+| `presence` | room perso `user:{id}` de chaque interlocuteur | `{ userId, online }` — un interlocuteur vient de se connecter (`true`, première socket) ou de se déconnecter (`false`, dernière socket) |
+| `presence:snapshot` | la socket qui vient de se connecter (ou d'émettre `presence:query`) | `{ online: string[] }` — ids des interlocuteurs actuellement en ligne |
 
 La diffusion est découplée des services métier via un `EventEmitter` interne : `MessagesService` émet un événement de domaine, `MessagingGateway` le relaie aux rooms.
+
+**Présence** (`PresenceService`) : suivi **en mémoire du process** des utilisateurs connectés (compteur de sockets par utilisateur ; l'état ne bascule qu'aux transitions 0↔1). À la connexion, la socket reçoit un `presence:snapshot` de ses interlocuteurs en ligne et, si l'utilisateur passe en ligne, ceux-ci reçoivent un `presence`. Les interlocuteurs sont résolus via `ConversationsService.listPartnerIds` (best-effort : une erreur DB ne casse pas la connexion). ⚠️ En multi-instance, chaque instance ne connaît que ses propres sockets — un backend Redis partagé serait nécessaire pour une présence globale.
 
 ## Événements d'intégration NATS
 
@@ -167,7 +172,7 @@ src/
   auth/          AppAuthGuard (+ @Public), RolesGuard (+ @Roles), AuthService (vérif JWT + maxAge + roles), @CurrentUser
   conversations/ ConversationsModule — création/liste paginée, soft-delete/restore, publie messaging.conversation.{created,read}
   messages/      MessagesModule — envoi, lecture, pagination, édition + versions, soft-delete/restore ; ContentCipherService
-  messaging/     MessagingGateway — Socket.IO, room par conversation, typing ; WsRateLimiterService ; WsExceptionFilter
+  messaging/     MessagingGateway — Socket.IO, room par conversation, typing, présence ; PresenceService ; WsRateLimiterService ; WsExceptionFilter
   nats/          NatsModule — NatsConnectionManager (reconnexion + JetStream optionnel), OutboxService (outbox durable), sujets
   audit/         AuditModule — AuditService (journal best-effort, table AuditLog)
   metrics/       MetricsModule — GET /metrics (Prometheus), MetricsInterceptor (durée/volume HTTP)
@@ -186,10 +191,10 @@ scripts/
 ## Tests
 
 ```bash
-npm test          # ~134 tests unitaires : guards (auth + roles), services conversations & messages (envoi, lecture,
+npm test          # ~150 tests unitaires : guards (auth + roles), services conversations & messages (envoi, lecture,
                   #   édition/versions, soft-delete, transaction + outbox), OutboxService (+ JetStream), NatsConnectionManager,
                   #   ContentCipherService, AuditService, RetentionService, MetricsService, rate limiter (mémoire + factory),
-                  #   WsRateLimiterService, gateway (+ typing), CORS, @MaxJsonSize
+                  #   WsRateLimiterService, gateway (+ typing + présence), PresenceService, CORS, @MaxJsonSize
 npm run test:e2e  # e2e (Prisma + NATS mockés) : boot, guard sur les routes, validation 400, rate limit 429,
                   #   GET /health public, GET /metrics, header x-request-id, routes soft-delete/edit guardées
 npm run typecheck # tsc --noEmit (src + test + scripts)
@@ -234,4 +239,4 @@ MESSAGING_JWT_SECRET=$(openssl rand -hex 32) docker compose up --build
 
 ## Hors périmètre
 
-Pas de **présence** ni de persistance des rooms. `RolesGuard` est en place mais **inactif** tant qu'aucun handler n'est décoré `@Roles(...)` et que l'hôte JobTrack n'ajoute pas de claim `roles` au JWT de messagerie. Sentry / error tracking : non retenu.
+**Présence** disponible en mémoire du process uniquement (pas de backend Redis partagé, donc pas de présence globale en multi-instance) ; pas de persistance des rooms ni de « dernière connexion » (`lastSeenAt`). `RolesGuard` est en place mais **inactif** tant qu'aucun handler n'est décoré `@Roles(...)` et que l'hôte JobTrack n'ajoute pas de claim `roles` au JWT de messagerie. Sentry / error tracking : non retenu.

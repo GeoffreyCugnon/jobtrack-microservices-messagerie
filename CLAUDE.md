@@ -214,8 +214,26 @@ Nouvelles deps : `helmet`, `nestjs-pino` + `pino` + `pino-http`, `prom-client`, 
 - `MESSAGING_CONTENT_ENCRYPTION_KEY` : à figer si activée (inchangé).
 - `RedisRateLimiter` : fenêtre **fixe** (vs glissante en mémoire) — rafale possible à cheval sur deux fenêtres, acceptable pour de l'anti-flood.
 - `RolesGuard` inactif tant que l'hôte JobTrack n'ajoute pas `roles` au JWT de messagerie (à coordonner avec l'item `RolesGuard CEO/recruteur` côté Backend).
-- Pas de `presence` (seul `typing` est fait).
 - Sentry / error tracking : non retenu.
+
+---
+
+## 0 septies. Présence en ligne (2026-09-10, sur `develop`)
+
+`npm run typecheck` ✓ · `npm run lint` ✓ · `npm run build` ✓ · `npm test` **147 ✓** · `npm run test:e2e` **11 ✓**.
+
+Dernier item « hors périmètre » restant du volet temps réel : la **présence en ligne / hors ligne** des interlocuteurs (le `typing` était déjà fait en §0 sexies).
+
+- **`PresenceService`** (`src/messaging/presence.service.ts`) : suivi **en mémoire du process**, `Map<userId, nombre de sockets>`. `connect()` / `disconnect()` ne renvoient `true` qu'aux transitions 0↔1 (passe en ligne / hors ligne) — gère le multi-onglet. `filterOnline(ids)` pour les snapshots.
+- **`ConversationsService.listPartnerIds(userId)`** : ids dédupliqués des autres participants des conversations non supprimées — sert à ne notifier la présence qu'aux personnes concernées. Spec ajoutée.
+- **Gateway** : `handleConnection` compte la socket puis, en tâche de fond (`void`, try/catch — une erreur DB ne casse pas la connexion), pousse `presence:snapshot { online: string[] }` à la nouvelle socket et, si l'utilisateur vient de passer en ligne, `presence { userId, online: true }` dans la room perso `user:{partnerId}` de chaque interlocuteur. `handleDisconnect` : sur la dernière socket, `presence { online: false }`. `@SubscribeMessage('presence:query')` renvoie un snapshot à la demande (reconnexion). `MessagingModule` importe désormais `ConversationsModule`.
+- **⚠️ Multi-instance** : chaque instance ne voit que ses propres sockets (même limite que le rate limiter en mode mémoire). Une présence globale demanderait un backend Redis partagé (compteur + pub/sub).
+- Tests : `presence.service.spec.ts` (transitions, multi-socket, `filterOnline`) ; `messaging.gateway.spec.ts` étendu (snapshot + broadcast connect/disconnect, `presence:query`, tolérance à un échec DB) ; `conversations.service.spec.ts` (`listPartnerIds`).
+
+### Reste ouvert
+
+- Pas de « dernière connexion » (`lastSeenAt`) : présence booléenne uniquement.
+- Présence non globale en multi-instance (cf. ⚠️ ci-dessus).
 
 ---
 

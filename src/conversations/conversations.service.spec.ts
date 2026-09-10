@@ -331,4 +331,31 @@ describe('ConversationsService', () => {
       expect(prisma.conversation.update).not.toHaveBeenCalled();
     });
   });
+
+  describe('listPartnerIds', () => {
+    it('returns the deduplicated ids of the other participants, excluding soft-deleted conversations', async () => {
+      prisma.conversation.findMany.mockResolvedValue([
+        { userAId: TEST_USERS.alice, userBId: TEST_USERS.bob },
+        { userAId: TEST_USERS.carol, userBId: TEST_USERS.alice },
+        // Deuxième conversation avec bob (paires normalisées différemment) : dédupliquée.
+        { userAId: TEST_USERS.alice, userBId: TEST_USERS.bob },
+      ]);
+
+      const partners = await service.listPartnerIds(TEST_USERS.alice);
+
+      expect(prisma.conversation.findMany).toHaveBeenCalledWith({
+        where: {
+          OR: [{ userAId: TEST_USERS.alice }, { userBId: TEST_USERS.alice }],
+          deletedAt: null,
+        },
+        select: { userAId: true, userBId: true },
+      });
+      expect(partners.sort()).toEqual([TEST_USERS.bob, TEST_USERS.carol].sort());
+    });
+
+    it('returns an empty array when the user has no conversation', async () => {
+      prisma.conversation.findMany.mockResolvedValue([]);
+      expect(await service.listPartnerIds(TEST_USERS.alice)).toEqual([]);
+    });
+  });
 });

@@ -184,6 +184,24 @@ export class ConversationsService {
   }
 
   /**
+   * Ids des autres participants de toutes les conversations non supprimées de
+   * `userId`, dédupliqués. Sert à la présence WebSocket : l'arrivée / le départ
+   * d'un utilisateur n'est notifié qu'aux personnes avec qui il a une
+   * conversation.
+   */
+  async listPartnerIds(userId: string): Promise<string[]> {
+    const rows = await this.prisma.conversation.findMany({
+      where: { OR: [{ userAId: userId }, { userBId: userId }], deletedAt: null },
+      select: { userAId: true, userBId: true },
+    });
+    const partners = new Set<string>();
+    for (const row of rows) {
+      partners.add(row.userAId === userId ? row.userBId : row.userAId);
+    }
+    return [...partners];
+  }
+
+  /**
    * Une conversation de l'appelant, avec son `unreadCount` (comme dans la liste).
    * Réservé à un participant ; 404 si inconnue ou supprimée.
    */
