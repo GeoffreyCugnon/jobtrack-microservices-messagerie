@@ -15,20 +15,19 @@ build:
   services:
     - docker:24-dind
   before_script:
-    # Alpine (docker:24, musl) : tout outil basé sur un CPython lié glibc
-    # (apk aws-cli, pip awscli...) plante à l'exécution. Le binaire officiel
-    # AWS CLI v2 est lui aussi lié glibc -> gcompat (compat glibc pour musl)
-    # est requis pour qu'il tourne ici, sinon même symptôme sous une autre forme.
-    - apk add --no-cache curl unzip gcompat
-    - curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
-    - unzip -q awscliv2.zip
-    - ./aws/install
-    - rm -rf awscliv2.zip aws/
-    - export PATH="/usr/local/bin:$PATH"
-    - aws --version
+    # N'installe aucun AWS CLI sur l'hôte Alpine du job (musl) : 3 approches
+    # différentes (apk aws-cli, pip awscli, binaire officiel + gcompat) ont
+    # toutes échoué sur cette même incompatibilité glibc/musl. À la place,
+    # on récupère le token ECR en lançant l'image AWS CLI officielle via le
+    # daemon dind déjà utilisé juste après pour build/push — aucun souci de
+    # compat puisqu'elle tourne dans son propre conteneur (glibc).
     - export AWS_ACCESS_KEY_ID="$GITLAB_AWS_ACCESS_KEY_ID"
     - export AWS_SECRET_ACCESS_KEY="$GITLAB_AWS_SECRET_ACCESS_KEY"
-    - aws ecr get-login-password --region "$AWS_DEFAULT_REGION" | docker login --username AWS --password-stdin "$ECR_REGISTRY"
+    - >
+      docker run --rm
+      -e AWS_ACCESS_KEY_ID -e AWS_SECRET_ACCESS_KEY -e AWS_DEFAULT_REGION="$AWS_DEFAULT_REGION"
+      public.ecr.aws/aws-cli/aws-cli ecr get-login-password --region "$AWS_DEFAULT_REGION"
+      | docker login --username AWS --password-stdin "$ECR_REGISTRY"
   script:
     - docker build -t "$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" -t "$ECR_REGISTRY/$ECR_REPOSITORY:latest" .
     - docker push "$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
