@@ -1,0 +1,38 @@
+# Déploiement prod de MS-Messagerie sur jobtrack-server.
+# Distinct de docker-compose.yml (dev local, build depuis les sources avec
+# postgres/nats/migrate embarqués) : ici l'image vient d'ECR (poussée par
+# .gitlab-ci.yml), et postgres-db/nats viennent de ../../infra/ (déjà
+# démarrée séparément, voir infra/README.md).
+#
+#   docker compose -f docker-compose.prod.yml up -d
+
+services:
+  migrate:
+    image: ${ECR_REGISTRY}/jobtrack-messagerie:${IMAGE_TAG:-latest}
+    command: ['npx', 'prisma', 'migrate', 'deploy']
+    env_file: .env
+    networks:
+      - jobtrack-network
+    restart: 'no'
+
+  messagerie:
+    image: ${ECR_REGISTRY}/jobtrack-messagerie:${IMAGE_TAG:-latest}
+    env_file: .env
+    ports:
+      - '${MESSAGING_PORT:-3100}:3100'
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    networks:
+      - jobtrack-network
+    restart: unless-stopped
+    healthcheck:
+      test: ['CMD-SHELL', 'wget -qO- http://localhost:3100/health || exit 1']
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+
+networks:
+  jobtrack-network:
+    external: true

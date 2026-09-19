@@ -860,69 +860,18 @@ prettier --write
 | `nest-cli.json` | Build config | ✓ OK | Rien à changer |
 | `tsconfig.json` | Compilateur TS | ✓ Strict | Considérer `const` pour string literals |
 | `eslint.config.mjs` | Linting ESM | ✓ OK | Ajouter règle sur `any` type |
-| `prisma.config.ts` | ??? | ⚠ N'existe pas | À vérifier |
+| `prisma.config.ts` | Config CLI Prisma 7 (schema/migrations path, datasource) | ✓ OK | Existe, lu par `migrate deploy`/`generate` — voir §7.2 |
 | `prisma/schema.prisma` | Modèles DB | ✓ OK | Ajouter commentaires sur constraints |
 
-### 7.2 Déploiement (recommandé)
+### 7.2 Déploiement (fait, septembre 2026)
 
-**Docker :**
-```dockerfile
-FROM node:20-alpine
-WORKDIR /app
-COPY package*.json ./
-RUN npm ci --only=production
-COPY dist .
-EXPOSE 3100
-CMD ["node", "dist/main.js"]
-```
+Ce qui suit n'est plus une recommandation mais l'état réel du repo — voir `../../CLAUDE.md` §Déploiement pour la vue d'ensemble (EC2 `jobtrack-server`, ECR, GitLab CI/CD, `infra/` partagée MySQL+PostgreSQL+NATS).
 
-**Docker Compose :**
-```yaml
-services:
-  ms-messagerie:
-    image: ms-messagerie:latest
-    ports:
-      - "3100:3100"
-    environment:
-      - MESSAGING_DATABASE_URL=postgresql://…
-      - MESSAGING_NATS_URL=nats://…
-      - MESSAGING_JWT_SECRET=… # Vault
-    depends_on:
-      - postgres-messaging
-      - nats-messaging
-
-  postgres-messaging:
-    image: postgres:16-alpine
-    environment:
-      POSTGRES_DB: messaging
-      POSTGRES_USER: messaging
-      POSTGRES_PASSWORD: …
-
-  nats-messaging:
-    image: nats:latest
-    ports:
-      - "4222:4222"
-```
-
-**CI/CD (GitHub Actions) :**
-```yaml
-name: CI
-
-on: [push, pull_request]
-
-jobs:
-  test:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: '20'
-      - run: npm ci
-      - run: npm run lint
-      - run: npm test
-      - run: npm run test:e2e
-```
+- **`Dockerfile`** (racine du repo, existant) : multi-stage `node:20-alpine`, stage `builder` (toolchain complet, aussi réutilisé par le service `migrate` du `docker-compose.yml` de dev via `target: builder`) → stage `runtime` (deps de prod uniquement, `EXPOSE 3100`, `USER node`). Le stage `runtime` embarque aussi `prisma/` + `prisma.config.ts` et la CLI Prisma (passée en **dependency**, pas devDependency) pour que `npx prisma migrate deploy` tourne directement depuis l'image finale.
+- **`docker-compose.yml`** (racine, existant, **dev local uniquement**) : bundle `postgres` + `nats` + `migrate` (build local, `target: builder`) + `ms-messagerie` — `docker compose up --build`.
+- **`docker-compose.prod.yml`** (nouveau) : déploiement sur `jobtrack-server` — un seul service applicatif (`messagerie`, image ECR `jobtrack-messagerie`) + `migrate` one-shot (même image, `command: npx prisma migrate deploy`), réseau externe `jobtrack-network`. `MESSAGING_DATABASE_URL`/`MESSAGING_NATS_URL` pointent vers `postgres-db`/`nats` de `../../infra/` (déjà démarrée séparément, hors CI/CD).
+- **`.gitlab-ci.yml`** (nouveau, GitLab self-hosted — remplace la suggestion GitHub Actions ci-dessous, obsolète) : stages `build` (push ECR, tags SHA court + `latest`) / `deploy` (SSH sur `jobtrack-server`, `docker compose -f docker-compose.prod.yml pull && up -d`), restreint à la branche `develop`. `.github/workflows/ci.yml` (lint/test) reste indépendant, non lié au déploiement.
+- **`.env.example`** (existant, retouché) : chaque variable documente désormais sa valeur dev (bundlée) vs sa valeur prod (`infra/`/`jobtrack-network`).
 
 ---
 
