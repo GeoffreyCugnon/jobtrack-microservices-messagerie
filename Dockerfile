@@ -15,6 +15,10 @@ FROM node:20-alpine AS runtime
 ENV NODE_ENV=production
 WORKDIR /app
 COPY package.json package-lock.json ./
+# prisma/ must be present BEFORE npm ci: the postinstall hook (`prisma
+# generate`) needs prisma/schema.prisma to run.
+COPY --from=builder /app/prisma ./prisma
+COPY --from=builder /app/prisma.config.ts ./prisma.config.ts
 # `prisma` (CLI) is a dependency (not devDependency): needed so
 # `npx prisma migrate deploy` runs from this same image (the `migrate`
 # service in docker-compose.prod.yml), without rebuilding from source on the
@@ -23,8 +27,6 @@ RUN npm ci --omit=dev && npm cache clean --force
 # Prisma 7 runs through the pg driver adapter — no Rust query-engine binary to
 # copy, just the compiled client that ships inside dist/.
 COPY --from=builder /app/dist ./dist
-COPY --from=builder /app/prisma ./prisma
-COPY --from=builder /app/prisma.config.ts ./prisma.config.ts
 USER node
 EXPOSE 3100
 CMD ["node", "dist/main.js"]
