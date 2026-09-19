@@ -53,13 +53,12 @@ deploy:
     - apk add --no-cache openssh-client
     - eval $(ssh-agent -s)
     - mkdir -p ~/.ssh && chmod 700 ~/.ssh
-    # "error in libcrypto" on ssh-add = corrupted SSH_PRIVATE_KEY content: tr
-    # strips a stray Windows \r, sed turns a literal \n (two characters,
-    # flattened when the variable was entered) back into a real newline.
-    # Written to a file (more reliable than piping into ssh-add -).
-    - printf '%s' "$SSH_PRIVATE_KEY" | tr -d '\r' | sed 's/\\n/\n/g' > ~/.ssh/deploy_key
-    - chmod 600 ~/.ssh/deploy_key
-    - ssh-add ~/.ssh/deploy_key
+    # SSH_PRIVATE_KEY is a GitLab File-type variable (group level): its value
+    # is a PATH to a file containing the key, not the key itself — which is
+    # why the previous attempts (treating $SSH_PRIVATE_KEY as text to write)
+    # kept failing: they were writing the path string, not the key.
+    - chmod 600 "$SSH_PRIVATE_KEY"
+    - ssh-add "$SSH_PRIVATE_KEY"
     - ssh-keyscan -H "$EC2_HOST" >> ~/.ssh/known_hosts
   script:
     - >
