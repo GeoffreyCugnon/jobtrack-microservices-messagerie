@@ -8,6 +8,11 @@ COPY package.json package-lock.json ./
 # generate`) needs prisma/schema.prisma to run, even at the builder stage.
 COPY prisma ./prisma
 COPY prisma.config.ts ./prisma.config.ts
+# prisma.config.ts uses the strict env() helper (throws if unset), which the
+# postinstall's `prisma generate` needs to resolve even though it never
+# connects to a DB. Build-time-only placeholder — env_file at runtime (real
+# MESSAGING_DATABASE_URL) overrides this image default, same as any ENV.
+ENV MESSAGING_DATABASE_URL="postgresql://user:pass@localhost:5432/db"
 RUN npm ci
 COPY . .
 # `prisma generate` writes the client to src/generated/prisma; `nest build`
@@ -23,6 +28,11 @@ COPY package.json package-lock.json ./
 # generate`) needs prisma/schema.prisma to run.
 COPY --from=builder /app/prisma ./prisma
 COPY --from=builder /app/prisma.config.ts ./prisma.config.ts
+# Same reason as the builder stage: npm ci --omit=dev still runs the
+# postinstall (`prisma generate`), which needs this to resolve even though
+# it never connects. Overridden by the real env_file value at container
+# runtime, same as the builder stage.
+ENV MESSAGING_DATABASE_URL="postgresql://user:pass@localhost:5432/db"
 # `prisma` (CLI) is a dependency (not devDependency): needed so
 # `npx prisma migrate deploy` runs from this same image (the `migrate`
 # service in docker-compose.prod.yml), without rebuilding from source on the
