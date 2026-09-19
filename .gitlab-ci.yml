@@ -44,7 +44,7 @@ build:
     - docker push "$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
     - docker push "$ECR_REGISTRY/$ECR_REPOSITORY:latest"
   rules:
-    - if: '$CI_COMMIT_BRANCH == "develop"'
+    - if: '$CI_COMMIT_BRANCH == "main"'
 
 deploy:
   stage: deploy
@@ -74,4 +74,4 @@ deploy:
       docker compose -f docker-compose.prod.yml up -d &&
       docker image prune -f"
   rules:
-    - if: '$CI_COMMIT_BRANCH == "develop"'
+    - if: '$CI_COMMIT_BRANCH == "main"'
