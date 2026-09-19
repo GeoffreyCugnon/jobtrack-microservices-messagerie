@@ -4,6 +4,10 @@
 FROM node:20-alpine AS builder
 WORKDIR /app
 COPY package.json package-lock.json ./
+# prisma/ must be present BEFORE npm ci: the postinstall hook (`prisma
+# generate`) needs prisma/schema.prisma to run, even at the builder stage.
+COPY prisma ./prisma
+COPY prisma.config.ts ./prisma.config.ts
 RUN npm ci
 COPY . .
 # `prisma generate` writes the client to src/generated/prisma; `nest build`
