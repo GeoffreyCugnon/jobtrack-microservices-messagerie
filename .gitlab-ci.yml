@@ -61,6 +61,11 @@ deploy:
     - ssh-add "$SSH_PRIVATE_KEY"
     - ssh-keyscan -H "$EC2_HOST" >> ~/.ssh/known_hosts
   script:
+    # docker-compose.prod.yml follows the same lifecycle as the app code
+    # (unlike ../../infra/docker-compose.yml, managed separately): CI
+    # resyncs it on every deploy instead of relying on a manual drop that
+    # would get forgotten on the next change.
+    - scp docker-compose.prod.yml "$EC2_USER@$EC2_HOST:$DEPLOY_PATH/docker-compose.prod.yml"
     - >
       ssh "$EC2_USER@$EC2_HOST"
       "cd $DEPLOY_PATH &&
