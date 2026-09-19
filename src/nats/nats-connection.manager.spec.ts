@@ -1,4 +1,5 @@
 import type { ConfigService } from '@nestjs/config';
+import { Logger } from '@nestjs/common';
 import { connect } from 'nats';
 import { NatsConnectionManager } from './nats-connection.manager';
 
@@ -65,6 +66,26 @@ describe('NatsConnectionManager', () => {
 
     expect(connectMock).toHaveBeenCalledTimes(2);
     expect(manager.connection).toBe(conn);
+  });
+
+  it('logs "unreachable" only once, not on every probe retry', async () => {
+    const warnSpy = jest.spyOn(Logger.prototype, 'warn').mockImplementation();
+    connectMock.mockRejectedValue(new Error('ECONNREFUSED'));
+
+    manager.onModuleInit();
+    await Promise.resolve();
+    await Promise.resolve();
+
+    await jest.advanceTimersByTimeAsync(10_000);
+    await jest.advanceTimersByTimeAsync(10_000);
+
+    const unreachableWarnings = warnSpy.mock.calls.filter((call) =>
+      String(call[0]).includes('unreachable'),
+    );
+    expect(unreachableWarnings).toHaveLength(1);
+    expect(connectMock).toHaveBeenCalledTimes(3);
+
+    warnSpy.mockRestore();
   });
 
   it('drops the reference when the connection closes', async () => {

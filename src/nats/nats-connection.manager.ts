@@ -37,6 +37,8 @@ export class NatsConnectionManager implements OnModuleInit, OnModuleDestroy {
   private connecting = false;
   private stopped = false;
   private probeTimer?: ReturnType<typeof setInterval>;
+  /** Évite de reloguer "unreachable" à chaque probe (toutes les 10s) tant que rien n'a changé. */
+  private hasWarnedUnreachable = false;
 
   /**
    * JetStream : quand activé (`MESSAGING_NATS_JETSTREAM=true`), l'outbox publie
@@ -118,6 +120,7 @@ export class NatsConnectionManager implements OnModuleInit, OnModuleDestroy {
         waitOnFirstConnect: false,
       });
       this.conn = conn;
+      this.hasWarnedUnreachable = false;
       this.logger.log(`Connected to NATS at ${this.servers}`);
       if (this.jetstreamEnabled) {
         await this.ensureStream(conn);
@@ -132,10 +135,13 @@ export class NatsConnectionManager implements OnModuleInit, OnModuleDestroy {
         );
       });
     } catch (err) {
-      this.logger.warn(
-        `NATS unreachable at ${this.servers} (${(err as Error).message}); ` +
-          `retrying every ${RECONNECT_PROBE_MS}ms`,
-      );
+      if (!this.hasWarnedUnreachable) {
+        this.hasWarnedUnreachable = true;
+        this.logger.warn(
+          `NATS unreachable at ${this.servers} (${(err as Error).message}); ` +
+            `retrying every ${RECONNECT_PROBE_MS}ms (further retries logged silently until connected)`,
+        );
+      }
     } finally {
       this.connecting = false;
     }
