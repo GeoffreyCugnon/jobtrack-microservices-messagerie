@@ -66,10 +66,15 @@ deploy:
     # resyncs it on every deploy instead of relying on a manual drop that
     # would get forgotten on the next change.
     - scp docker-compose.prod.yml "$EC2_USER@$EC2_HOST:$DEPLOY_PATH/docker-compose.prod.yml"
+    # The ECR docker login token expires after 12h: without this refresh, a
+    # deploy past that window fails on pull with "authorization token has
+    # expired". The EC2 host has its own AWS CLI + ~/.aws/credentials
+    # (independent from the GitLab CI credentials used by the build stage).
     - >
       ssh "$EC2_USER@$EC2_HOST"
       "cd $DEPLOY_PATH &&
       export ECR_REGISTRY=$ECR_REGISTRY IMAGE_TAG=$IMAGE_TAG &&
+      aws ecr get-login-password --region $AWS_DEFAULT_REGION | docker login --username AWS --password-stdin $ECR_REGISTRY &&
       docker compose -f docker-compose.prod.yml pull &&
       docker compose -f docker-compose.prod.yml up -d &&
       docker image prune -f"
