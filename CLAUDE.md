@@ -872,6 +872,7 @@ Ce qui suit n'est plus une recommandation mais l'état réel du repo — voir `.
 - **`docker-compose.prod.yml`** (nouveau) : déploiement sur `jobtrack-server` — un seul service applicatif (`messagerie`, image ECR `jobtrack-messagerie`) + `migrate` one-shot (même image, `command: npx prisma migrate deploy`), réseau externe `jobtrack-network`. `MESSAGING_DATABASE_URL`/`MESSAGING_NATS_URL` pointent vers `postgres-db`/`nats` de `../../infra/` (déjà démarrée séparément, hors CI/CD).
 - **`.gitlab-ci.yml`** (nouveau, GitLab self-hosted — remplace la suggestion GitHub Actions ci-dessous, obsolète) : stages `build` (push ECR, tags SHA court + `latest`) / `deploy` (SSH sur `jobtrack-server`, `docker compose -f docker-compose.prod.yml pull && up -d`), restreint à la branche `develop`. `.github/workflows/ci.yml` (lint/test) reste indépendant, non lié au déploiement.
 - **`.env.example`** (existant, retouché) : chaque variable documente désormais sa valeur dev (bundlée) vs sa valeur prod (`infra/`/`jobtrack-network`).
+- **Historique réécrit le 2026-10-02** (`git filter-repo`, force push sur `develop`/`main`) pour remplacer l'IP publique de l'EC2 de prod par `<IP_EC2>` dans `.env.example`, en prévision d'un miroir GitHub public. Les hash de commits antérieurs à cette date ont changé.
 
 ---
 
