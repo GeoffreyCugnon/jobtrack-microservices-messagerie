@@ -4,7 +4,7 @@ stages:
 
 variables:
   AWS_DEFAULT_REGION: eu-west-3
-  ECR_REGISTRY: '<AWS_ACCOUNT_ID>.dkr.ecr.eu-west-3.amazonaws.com'
+  ECR_REGISTRY: '$AWS_ACCOUNT_ID.dkr.ecr.eu-west-3.amazonaws.com'
   ECR_REPOSITORY: 'jobtrack-messagerie'
   IMAGE_TAG: '$CI_COMMIT_SHORT_SHA'
   DEPLOY_PATH: '/opt/jobtrack/messagerie'
