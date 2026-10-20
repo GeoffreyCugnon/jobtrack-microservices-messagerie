@@ -18,8 +18,9 @@ services:
   messagerie:
     image: ${ECR_REGISTRY}/jobtrack-messagerie:${IMAGE_TAG:-latest}
     env_file: .env
+    # Joignable uniquement via le Nginx de l'hôte (infra/nginx/jobtrack.conf).
     ports:
-      - '${MESSAGING_PORT:-3100}:3100'
+      - '127.0.0.1:${MESSAGING_PORT:-3100}:3100'
     depends_on:
       migrate:
         condition: service_completed_successfully
